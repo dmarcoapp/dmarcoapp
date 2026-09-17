@@ -1,0 +1,295 @@
+name: dmarco
+
+x-backend-image: &backend-image ghcr.io/dmarcoapp/backend:${BACKEND_VERSION:-latest}
+
+x-backend-environment: &backend-environment
+  APP_DMARC_AGGREGATE_REPORT_EMAIL_RECEIVER_DOMAIN: ${REPORT_DOMAIN:?Set REPORT_DOMAIN in .env}
+  APP_EMAIL_SENDER_ADDRESS: ${APP_EMAIL_SENDER_ADDRESS:?Set APP_EMAIL_SENDER_ADDRESS in .env}
+  APP_FRONTEND_URL: ${APP_SCHEME:-https}://${APP_DOMAIN:?Set APP_DOMAIN in .env}
+  APP_INBOUND_REPORT_EMAIL_WEBHOOK_SECRET: ${WEBHOOK_SECRET:?Set WEBHOOK_SECRET in .env}
+  APP_REGISTRATION_ENABLED: ${APP_REGISTRATION_ENABLED:-false}
+  APP_REPORT_RETENTION_DAYS: ${APP_REPORT_RETENTION_DAYS:-365}
+  APP_SECRET: ${APP_SECRET:?Set APP_SECRET in .env}
+  CORS_ALLOW_ORIGIN: ${CORS_ALLOW_ORIGIN:?Set CORS_ALLOW_ORIGIN in .env}
+  DATABASE_URL: postgresql://${POSTGRES_USER:-dmarco}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@database:5432/${POSTGRES_DB:-dmarco}?serverVersion=${POSTGRES_VERSION:-16}&charset=utf8
+  DEFAULT_URI: ${APP_SCHEME:-https}://${APP_DOMAIN}
+  LOCK_DSN: redis://redis
+  MAILER_DSN: ${MAILER_DSN:?Set MAILER_DSN in .env}
+  MESSENGER_ASYNC_HIGH_TRANSPORT_DSN: amqp://${RABBITMQ_USER:-dmarco}:${RABBITMQ_PASSWORD:?Set RABBITMQ_PASSWORD in .env}@rabbitmq:5672/%2f/messages
+  MESSENGER_ASYNC_LOW_TRANSPORT_DSN: amqp://${RABBITMQ_USER:-dmarco}:${RABBITMQ_PASSWORD}@rabbitmq:5672/%2f/messages
+  REDIS_DSN: redis://redis
+  S3_ACCESS_KEY: ${S3_ACCESS_KEY:?Set S3_ACCESS_KEY in .env}
+  S3_BUCKET: ${S3_BUCKET:-mail}
+  S3_ENDPOINT: ${S3_ENDPOINT:-http://minio:9000}
+  S3_FORCE_PATH_STYLE: ${S3_FORCE_PATH_STYLE:-true}
+  S3_REGION: ${S3_REGION:-us-east-1}
+  S3_SECRET_KEY: ${S3_SECRET_KEY:?Set S3_SECRET_KEY in .env}
+
+services:
+  # ---------------------------------------------------------------- web entry
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    environment:
+      ACME_EMAIL: ${ACME_EMAIL:?Set ACME_EMAIL in .env}
+      APP_DOMAIN: ${APP_DOMAIN}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - dashboard
+      - php
+
+  dashboard:
+    image: ghcr.io/dmarcoapp/dashboard:${DASHBOARD_VERSION:-latest}
+    restart: unless-stopped
+    environment:
+      DMARCO_API_BASE_URL: /api
+      DMARCO_DISABLE_REGISTRATION: ${DASHBOARD_DISABLE_REGISTRATION:-true}
+      DMARCO_MOCK_MODE: "false"
+
+  # ------------------------------------------------------------------ backend
+  php:
+    image: *backend-image
+    restart: unless-stopped
+    environment:
+      <<: *backend-environment
+      SERVER_NAME: ":80"
+    volumes:
+      - jwt_keys:/app/config/jwt
+      - backend_caddy_data:/data
+      - backend_caddy_config:/config
+    depends_on:
+      database:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+
+  worker:
+    image: *backend-image
+    restart: unless-stopped
+    command: sh -c "sleep 20 && php bin/console messenger:consume --all --no-ansi --memory-limit=128M --time-limit=3600"
+    environment:
+      <<: *backend-environment
+    # The image health check probes the web server, which this container does
+    # not run. Check that the message consumer is alive instead.
+    healthcheck:
+      test: ["CMD", "pidof", "php"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    volumes:
+      - jwt_keys:/app/config/jwt
+    depends_on:
+      database:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      php:
+        condition: service_started
+
+  # ---------------------------------------------------------------- inbound mail
+  postfix:
+    image: ghcr.io/dmarcoapp/mail-inbound/postfix:${MAIL_INBOUND_VERSION:-latest}
+    restart: unless-stopped
+    environment:
+      ACCEPTED_RCPT_DOMAIN: ${REPORT_DOMAIN}
+      MAX_MESSAGE_BYTES: ${MAX_MESSAGE_BYTES:-10485760}
+      SELF_SIGNED_CERT_DAYS: ${SELF_SIGNED_CERT_DAYS:-3650}
+      SMTP_HOSTNAME: ${SMTP_HOSTNAME:?Set SMTP_HOSTNAME in .env}
+      SMTP_TLS_CHAIN_FILE: ${SMTP_TLS_CHAIN_FILE:-/certs/smtp.pem}
+      SMTP_TLS_MODE: ${SMTP_TLS_MODE:-self-signed}
+    ports:
+      - "25:25"
+    volumes:
+      - certs_shared:/certs:ro
+      - maildrop:/maildrop
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/healthcheck-mail-stack"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  processor:
+    image: ghcr.io/dmarcoapp/mail-inbound/processor:${MAIL_INBOUND_VERSION:-latest}
+    restart: unless-stopped
+    environment:
+      CLAMAV_SCAN_ENABLED: ${CLAMAV_SCAN_ENABLED:-true}
+      S3_BUCKET: ${S3_BUCKET:-mail}
+      S3_ENDPOINT: ${S3_ENDPOINT:-http://minio:9000}
+      S3_FORCE_PATH_STYLE: ${S3_FORCE_PATH_STYLE:-true}
+      S3_REGION: ${S3_REGION:-us-east-1}
+      SMTP_HOSTNAME: ${SMTP_HOSTNAME}
+      WEBHOOK_URL: http://php/v1/webhook/inbound_report_email
+    secrets:
+      - webhook_secret
+      - s3_access_key
+      - s3_secret_key
+    volumes:
+      - maildrop:/maildrop
+    depends_on:
+      clamav:
+        condition: service_started
+      minio-init:
+        condition: service_completed_successfully
+      php:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "node", "src/processorHealthcheck.js"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 75s
+
+  clamav:
+    image: clamav/clamav-debian:1.4
+    restart: unless-stopped
+    volumes:
+      - ./clamav/clamd.conf:/etc/clamav/clamd.conf:ro
+      - ./clamav/freshclam.conf:/etc/clamav/freshclam.conf:ro
+      - clamav_data:/var/lib/clamav
+    healthcheck:
+      test: ["CMD", "clamdscan", "--version"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ------------------------------------- publicly trusted MX certificate (opt-in)
+  certbot:
+    image: ghcr.io/dmarcoapp/mail-inbound/certbot:${MAIL_INBOUND_VERSION:-latest}
+    profiles:
+      - letsencrypt
+    restart: unless-stopped
+    environment:
+      CERT_EMAIL: ${ACME_EMAIL}
+      SMTP_HOSTNAME: ${SMTP_HOSTNAME}
+    secrets:
+      - cloudflare_api_token
+    volumes:
+      - letsencrypt:/etc/letsencrypt
+      - letsencrypt_lib:/var/lib/letsencrypt
+
+  cert-exporter:
+    image: ghcr.io/dmarcoapp/mail-inbound/cert-exporter:${MAIL_INBOUND_VERSION:-latest}
+    profiles:
+      - letsencrypt
+    restart: unless-stopped
+    environment:
+      SMTP_HOSTNAME: ${SMTP_HOSTNAME}
+    depends_on:
+      certbot:
+        condition: service_started
+    volumes:
+      - letsencrypt:/etc/letsencrypt:ro
+      - certs_shared:/certs
+
+  # --------------------------------------------------------------- data stores
+  database:
+    image: postgres:${POSTGRES_VERSION:-16}-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-dmarco}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_USER: ${POSTGRES_USER:-dmarco}
+    volumes:
+      - database_data:/var/lib/postgresql/data:rw
+    healthcheck:
+      test: ["CMD", "pg_isready", "-d", "${POSTGRES_DB:-dmarco}", "-U", "${POSTGRES_USER:-dmarco}"]
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      timeout: 5s
+      retries: 5
+
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD}
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-dmarco}
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "check_running"]
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  minio:
+    image: quay.io/minio/minio:RELEASE.2025-02-07T23-21-09Z
+    restart: unless-stopped
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY}
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY}
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  minio-init:
+    image: quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z
+    environment:
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY}
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY}
+      S3_BUCKET: ${S3_BUCKET:-mail}
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        until mc alias set local http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD"; do
+          sleep 2
+        done
+        mc mb --ignore-existing "local/$$S3_BUCKET"
+
+volumes:
+  backend_caddy_config:
+  backend_caddy_data:
+  caddy_config:
+  caddy_data:
+  certs_shared:
+  clamav_data:
+  database_data:
+  jwt_keys:
+  letsencrypt:
+  letsencrypt_lib:
+  maildrop:
+  minio_data:
+  rabbitmq_data:
+  redis_data:
+
+secrets:
+  cloudflare_api_token:
+    file: ./secrets/cloudflare_token.txt
+  s3_access_key:
+    file: ./secrets/s3_access_key.txt
+  s3_secret_key:
+    file: ./secrets/s3_secret_key.txt
+  webhook_secret:
+    file: ./secrets/webhook_secret.txt

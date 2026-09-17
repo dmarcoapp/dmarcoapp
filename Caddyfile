@@ -1,0 +1,29 @@
+# Public entry point for DMARCo.
+#
+# Serves the dashboard on APP_DOMAIN and proxies /api/* to the backend, so the
+# whole application runs on a single domain with a single certificate.
+# Certificates are obtained and renewed automatically by Caddy.
+
+{
+	email {$ACME_EMAIL}
+}
+
+{$APP_DOMAIN} {
+	encode zstd gzip
+
+	header {
+		Referrer-Policy "strict-origin-when-cross-origin"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+	}
+
+	handle_path /api/* {
+		reverse_proxy php:80 {
+			header_up X-Forwarded-Prefix /api
+		}
+	}
+
+	handle {
+		reverse_proxy dashboard:80
+	}
+}
