@@ -224,6 +224,12 @@ services:
   rabbitmq:
     image: rabbitmq:3.13-management
     restart: unless-stopped
+    # RabbitMQ keeps its data under its node name, rabbit@<hostname>, and
+    # Compose hands out the container id as the hostname unless it is told
+    # otherwise. A fixed one is what makes the volume outlive the container:
+    # with a new name every time, a recreated container starts on an empty
+    # node and the messages waiting in the queues are left behind.
+    hostname: rabbitmq
     environment:
       RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD}
       RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-dmarco}
