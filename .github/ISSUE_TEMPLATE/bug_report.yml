@@ -1,0 +1,59 @@
+name: Bug report
+description: Something in DMARCo does not work
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This tracker covers all of DMARCo, so report the problem here whichever
+        component it comes from. Please remove passwords, secrets and real
+        report data from anything you paste.
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Where does it go wrong?
+      options:
+        - Installation or upgrade
+        - Receiving report email
+        - Report processing
+        - Dashboard or API
+        - Accounts, sign-in or two-factor
+        - Something else / not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: >
+        The image tags you run, from the *_VERSION settings in .env, or the
+        output of `docker compose images`.
+      placeholder: "latest"
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Server and container state
+      description: Output of `docker compose ps` and, if relevant, `uname -a`.
+      render: text
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: >
+        Relevant output of `docker compose logs <service>`, for example caddy,
+        php, worker, postfix or processor.
+      render: text

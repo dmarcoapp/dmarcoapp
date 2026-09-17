@@ -1,7 +1,25 @@
-# DMARCo
+<p align="center">
+  <img src=".github/logo.svg" alt="" width="80" height="80">
+</p>
 
-Self-hosted DMARC report aggregation. Point your domains at your own server and
-find out who is sending email as you.
+<h1 align="center">DMARCo</h1>
+
+<p align="center">
+  Self-hosted DMARC report aggregation. Point your domains at your own server
+  and find out who is sending email as you.
+</p>
+
+<p align="center">
+  <a href="LICENSE"><img alt="License: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-blue.svg"></a>
+  <a href="https://github.com/dmarcoapp/dmarcoapp/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/dmarcoapp/dmarcoapp/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://github.com/dmarcoapp/dmarcoapp/issues"><img alt="Issues" src="https://img.shields.io/github/issues/dmarcoapp/dmarcoapp.svg"></a>
+</p>
+
+> [!IMPORTANT]
+> **Start here.** This repository installs all of DMARCo with one command, and
+> it is the issue tracker for the whole project. Whatever goes wrong, whichever
+> component it comes from, report it here:
+> [open an issue](https://github.com/dmarcoapp/dmarcoapp/issues/new/choose).
 
 DMARC reports tell you which servers send mail using your domain, and whether
 that mail passes SPF and DKIM. Mailbox providers send those reports as XML
@@ -306,6 +324,23 @@ and `APP_DOMAIN` has to resolve to this server before it can get a certificate.
 **Something else.** `docker compose ps` shows any container that is unhealthy,
 and `docker compose logs <name>` shows why.
 
+## Help and issues
+
+Something broken, unclear, or missing? Open an issue here, in this repository:
+
+- [Report a problem](https://github.com/dmarcoapp/dmarcoapp/issues/new/choose)
+  — installation, upgrades, mail delivery, the dashboard, the API, anything
+- [Suggest a feature](https://github.com/dmarcoapp/dmarcoapp/issues/new/choose)
+
+This is the tracker for every part of DMARCo, so you never have to work out
+which component a problem belongs to. Include the output of `docker compose ps`
+and the relevant `docker compose logs`, and leave out anything sensitive.
+
+Found a security vulnerability? Please do not open a public issue — see
+[`SECURITY.md`](SECURITY.md).
+
+Want to contribute code? See [`CONTRIBUTING.md`](CONTRIBUTING.md).
+
 ## What this repository is
 
 The installer and the Compose stack. The application itself is developed in
@@ -317,4 +352,5 @@ three repositories, and this stack runs their published images:
 
 ## License
 
-Licensed under the Apache License, Version 2.0. See [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE).
+Licensed under the Apache License, Version 2.0. See [`LICENSE`](LICENSE) and
+[`NOTICE`](NOTICE).
