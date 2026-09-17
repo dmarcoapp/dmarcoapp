@@ -146,20 +146,44 @@ compose() {
 }
 
 wait_for_service() {
-    local service="$1" timeout="${2:-300}" waited=0 id state
+    local service="$1" timeout="${2:-300}" waited=0 id state restarts baseline=''
     while [ "$waited" -lt "$timeout" ]; do
         id="$(compose ps -q "$service" 2> /dev/null | head -n 1)"
         if [ -n "$id" ]; then
             state="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$id" 2> /dev/null || printf 'unknown')"
+            restarts="$(docker inspect -f '{{.RestartCount}}' "$id" 2> /dev/null || printf '0')"
+            # "unhealthy" is not decisive: a container whose start takes longer
+            # than its health check allows for, such as the backend running a
+            # long migration, reports it and then recovers.
             case "$state" in
                 healthy | running) return 0 ;;
                 exited | dead) return 1 ;;
+            esac
+            # A container that restarts while we watch is failing at startup,
+            # and its health check never gets far enough to report anything but
+            # "starting", so waiting out the timeout would only hide the error.
+            # The count is a lifetime total, hence the comparison with what this
+            # wait started from rather than with zero.
+            case "$restarts" in
+                '' | *[!0-9]*) ;;
+                *)
+                    [ -n "$baseline" ] || baseline="$restarts"
+                    [ "$restarts" -le "$baseline" ] || return 1
+                    ;;
             esac
         fi
         sleep 3
         waited=$((waited + 3))
     done
     return 1
+}
+
+# Prints the end of a service log, indented, so a failure explains itself
+# instead of sending the reader looking for it.
+show_log_tail() {
+    local service="$1" lines="${2:-15}"
+    compose logs --no-color --tail "$lines" "$service" 2> /dev/null |
+        sed 's/^/       /' >&2 || true
 }
 
 check_requirements() {
@@ -254,6 +278,67 @@ check_report_domain() {
         die "Run the installer again with a domain that does not receive other email."
 }
 
+# Reads settings out of an existing .env, skipping the ones the caller already
+# has, because a value in the environment is the one Compose uses as well. The
+# file is read rather than sourced: the shell would eat the backslashes and
+# dollar signs that Compose passes through untouched, among them the ones in
+# the CORS_ALLOW_ORIGIN regular expression. Succeeds when it read anything.
+load_env_values() {
+    local file="${INSTALL_DIR}/.env" key value loaded=1
+    [ -f "$file" ] || return 1
+
+    for key in "$@"; do
+        [ -z "${!key:-}" ] || continue
+        value="$(sed -n "s/^[[:space:]]*${key}=//p" "$file" | head -n 1)"
+        value="${value%$'\r'}"
+        # Compose strips one pair of surrounding quotes, and so does this.
+        case "$value" in
+            \"*\") value="${value#\"}"; value="${value%\"}" ;;
+            \'*\') value="${value#\'}"; value="${value%\'}" ;;
+        esac
+        [ -n "$value" ] || continue
+        printf -v "$key" '%s' "$value"
+        loaded=0
+    done
+
+    return "$loaded"
+}
+
+# Postgres and RabbitMQ store the password they are given the first time they
+# initialize their volume and ignore the environment from then on, so freshly
+# generated secrets would lock the stack out of data an earlier install left
+# behind. An overwrite therefore starts from the secrets already on disk, the
+# rest of them included, so nothing signed with the old ones breaks either.
+keep_existing_secrets() {
+    if load_env_values APP_SECRET WEBHOOK_SECRET POSTGRES_PASSWORD \
+        RABBITMQ_PASSWORD S3_ACCESS_KEY S3_SECRET_KEY; then
+        info "Keeping the secrets from the existing .env, which its data depends on"
+    fi
+}
+
+# What the installer itself needs when it keeps an existing .env: the summary
+# prints the domains, and the passwords have to match what the data stores
+# have. The rest of the file is Compose's business, and Compose reads it.
+load_existing_configuration() {
+    load_env_values APP_DOMAIN APP_SCHEME REPORT_DOMAIN SMTP_HOSTNAME \
+        POSTGRES_USER POSTGRES_PASSWORD RABBITMQ_USER RABBITMQ_PASSWORD || true
+}
+
+# Docker volumes outlive the install directory, so an install that starts
+# without an .env can still land on the data of an earlier one.
+existing_data_volume() {
+    local project="${COMPOSE_PROJECT_NAME:-dmarco}"
+    docker volume ls --quiet --filter "name=^${project}_database_data$" 2> /dev/null |
+        grep -q .
+}
+
+report_existing_data() {
+    existing_data_volume || return 0
+    warn "An earlier DMARCo install left its data behind in Docker volumes."
+    warn "Its reports and accounts are kept, and its stored passwords are updated to the ones this install generates."
+    warn "To start from nothing instead, delete that data first, which cannot be undone: cd ${INSTALL_DIR} && docker compose down -v"
+}
+
 write_configuration() {
     info "Writing configuration"
 
@@ -309,10 +394,59 @@ write_configuration() {
     umask 022
 }
 
+# Both data stores only read their password from the environment while they
+# initialize an empty volume. Over data from an earlier install they keep that
+# install's password instead, and every part of DMARCo then fails to sign in.
+# Setting the password from .env on every run keeps .env the one place it is
+# defined.
+sync_credentials() {
+    local db_user="${POSTGRES_USER:-dmarco}" broker_user="${RABBITMQ_USER:-dmarco}"
+
+    info "Setting the stored passwords"
+
+    # :'password' lets psql quote the value, so a password containing a quote
+    # stays a password instead of becoming SQL.
+    if [ -z "${POSTGRES_PASSWORD:-}" ]; then
+        warn "There is no POSTGRES_PASSWORD to set."
+    elif printf '%s\n' "ALTER ROLE \"${db_user}\" WITH PASSWORD :'password';" |
+        compose exec -T database psql --quiet --no-psqlrc \
+            --username "$db_user" --dbname postgres \
+            -v ON_ERROR_STOP=1 -v "password=${POSTGRES_PASSWORD}" > /dev/null 2>&1; then
+        ok "Database"
+    else
+        warn "Could not set the database password."
+        warn "If this server still holds data from an earlier install, put that install's POSTGRES_PASSWORD back in ${INSTALL_DIR}/.env, or delete the old data with: cd ${INSTALL_DIR} && docker compose down -v"
+    fi
+
+    if [ -z "${RABBITMQ_PASSWORD:-}" ]; then
+        warn "There is no RABBITMQ_PASSWORD to set."
+    elif compose exec -T rabbitmq rabbitmqctl -q change_password "$broker_user" "$RABBITMQ_PASSWORD" > /dev/null 2>&1; then
+        ok "Message broker"
+    elif compose exec -T -e DMARCO_USER="$broker_user" -e DMARCO_PASSWORD="$RABBITMQ_PASSWORD" rabbitmq sh -c '
+        rabbitmqctl -q add_user "$DMARCO_USER" "$DMARCO_PASSWORD" &&
+            rabbitmqctl -q set_user_tags "$DMARCO_USER" administrator &&
+            rabbitmqctl -q set_permissions -p / "$DMARCO_USER" ".*" ".*" ".*"' > /dev/null 2>&1; then
+        ok "Message broker"
+    else
+        warn "Could not set the message broker password. Check: docker compose logs rabbitmq"
+    fi
+}
+
 start_stack() {
     info "Pulling images, which takes a few minutes on the first run"
     compose pull --quiet ||
         die "Could not pull the images. Check the network connection and run the installer again."
+
+    # The data stores go up first, because their passwords have to match .env
+    # before anything tries to connect.
+    info "Starting the database and the message broker"
+    compose up -d database rabbitmq ||
+        die "Could not start them. See what went wrong with: cd ${INSTALL_DIR} && docker compose logs database rabbitmq"
+    if wait_for_service database 300 && wait_for_service rabbitmq 300; then
+        sync_credentials
+    else
+        warn "The database or the message broker did not come up. Check: docker compose logs database rabbitmq"
+    fi
 
     info "Starting DMARCo"
     compose up -d ||
@@ -320,13 +454,21 @@ start_stack() {
 
     info "Waiting for the application to become ready"
     if wait_for_service php 300; then
+        BACKEND_READY=1
         ok "Backend is up"
     else
-        warn "The backend did not report healthy in time. Check: docker compose logs php"
+        warn "The backend did not come up. The end of its log:"
+        show_log_tail php
+        warn "Full log: cd ${INSTALL_DIR} && docker compose logs php"
     fi
 }
 
 configure_application() {
+    if [ -z "${BACKEND_READY:-}" ]; then
+        warn "Skipping the JWT keys and the first account until the backend runs."
+        return 0
+    fi
+
     info "Generating JWT keys"
     if compose exec -T php sh -lc 'php bin/console lexik:jwt:generate-keypair --skip-if-exists --no-interaction' > /dev/null 2>&1; then
         ok "JWT keys"
@@ -356,9 +498,16 @@ print_summary() {
     REPORT_DOMAIN="${REPORT_DOMAIN:-$APP_DOMAIN}"
     SMTP_HOSTNAME="${SMTP_HOSTNAME:-$APP_DOMAIN}"
 
-    cat <<- EOF
+    if [ -n "${BACKEND_READY:-}" ]; then
+        printf '\n%s%sDMARCo is running.%s\n' "$C_GREEN" "$C_BOLD" "$C_RESET"
+    else
+        printf '\n%s%sDMARCo is installed, but the backend is not running.%s\n' \
+            "$C_YELLOW" "$C_BOLD" "$C_RESET"
+        printf '%sFix what its log reports, then: cd %s && docker compose up -d%s\n' \
+            "$C_DIM" "$INSTALL_DIR" "$C_RESET"
+    fi
 
-		${C_GREEN}${C_BOLD}DMARCo is running.${C_RESET}
+    cat <<- EOF
 
 		  Dashboard      ${C_BOLD}${url}${C_RESET}
 		  Directory      ${INSTALL_DIR}
@@ -446,17 +595,16 @@ main() {
     if [ -f "${INSTALL_DIR}/.env" ]; then
         warn "${INSTALL_DIR}/.env already exists."
         if confirm "Keep it and only restart the stack?"; then
-            set -a
-            # shellcheck disable=SC1091
-            . "${INSTALL_DIR}/.env"
-            set +a
+            load_existing_configuration
         else
             confirm "Overwrite the existing configuration?" ||
                 die "Nothing to do."
+            keep_existing_secrets
             collect_configuration
             write_configuration
         fi
     else
+        report_existing_data
         collect_configuration
         write_configuration
     fi

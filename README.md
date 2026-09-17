@@ -332,6 +332,21 @@ docker compose exec php bin/console app:user:verification-email:resend
 and `APP_DOMAIN` has to resolve to this server before it can get a certificate.
 `docker compose logs caddy` says which of the two went wrong.
 
+**`password authentication failed for user "dmarco"`.** The database still has
+the password of an earlier install. Postgres reads `POSTGRES_PASSWORD` only when
+it creates its data directory, and Docker volumes outlive the directory you
+installed into, so a reinstall with fresh secrets cannot sign in to the data it
+finds. Running `install.sh` again sets the stored passwords from `.env`. By
+hand, with the values from `.env`:
+
+```bash
+docker compose exec database psql -U dmarco -d postgres \
+  -c "ALTER ROLE dmarco WITH PASSWORD 'POSTGRES_PASSWORD from .env'"
+docker compose exec rabbitmq \
+  rabbitmqctl change_password dmarco 'RABBITMQ_PASSWORD from .env'
+docker compose up -d
+```
+
 **Something else.** `docker compose ps` shows any container that is unhealthy,
 and `docker compose logs <name>` shows why.
 
