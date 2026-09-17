@@ -1,7 +1,7 @@
 # Security Policy
 
 DMARCo receives email from the public internet and stores report data on your
-own server, so security reports are taken seriously and handled first.
+own server, so security reports come before everything else.
 
 ## Supported versions
 
@@ -15,18 +15,18 @@ a discussion.
 
 Report it privately through GitHub:
 [Report a vulnerability](https://github.com/dmarcoapp/dmarcoapp/security/advisories/new).
-This works for every part of DMARCo — the installer, the backend, the dashboard
-and the mail gateway — so report it here even if the bug lives in one of the
+This works for every part of DMARCo: the installer, the backend, the dashboard,
+and the mail gateway. Report it here even if the bug lives in one of the
 component repositories.
 
 Helpful details:
 
-- what an attacker can do, and what access they need to start
-- the affected component and version, from `docker compose ps` or your `.env`
-- steps or a proof of concept that reproduces it
-- logs or configuration, with secrets and report data removed
+- What an attacker can do, and what access they need to start
+- The affected component and version, from `docker compose ps` or your `.env`
+- Steps or a proof of concept that reproduces it
+- Logs or configuration, with secrets and report data removed
 
-You can expect an acknowledgement within a few days. Once a fix is released, the
+You can expect an acknowledgment within a few days. Once a fix is released, the
 advisory is published with credit to the reporter, unless you would rather stay
 anonymous.
 

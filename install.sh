@@ -211,7 +211,7 @@ fetch_stack() {
 
 collect_configuration() {
     info "Configuration"
-    printf '%sDMARCo needs a domain that points to this server, and an SMTP account\nfor account emails such as verification and two-factor codes.%s\n\n' "$C_DIM" "$C_RESET"
+    printf '%sDMARCo needs a domain that points to this server, and an SMTP account it\ncan send verification and two-factor emails from.%s\n\n' "$C_DIM" "$C_RESET"
 
     ask APP_DOMAIN "Domain for the dashboard and API" ""
     ask ACME_EMAIL "Email address for Let's Encrypt" ""
@@ -301,13 +301,16 @@ write_configuration() {
     # Only used when SMTP_TLS_MODE=real, see the README.
     [ -f "${INSTALL_DIR}/secrets/cloudflare_token.txt" ] ||
         printf 'unused\n' > "${INSTALL_DIR}/secrets/cloudflare_token.txt"
-    chmod 600 "${INSTALL_DIR}"/secrets/*.txt
+    # Docker mounts these files into the containers keeping the host's owner and
+    # mode, and the processor runs as an unprivileged user that is not this one.
+    # The 0700 directory is what keeps other users on the host out.
+    chmod 644 "${INSTALL_DIR}"/secrets/*.txt
     ok "secrets/"
     umask 022
 }
 
 start_stack() {
-    info "Pulling images, this takes a few minutes on the first run"
+    info "Pulling images, which takes a few minutes on the first run"
     compose pull --quiet ||
         die "Could not pull the images. Check the network connection and run the installer again."
 
@@ -333,14 +336,14 @@ configure_application() {
     fi
 
     if ! has_tty; then
-        warn "No terminal available. Create your account with: docker compose exec php bin/console app:user:create"
+        warn "No terminal available. Create your account with: docker compose exec php bin/console app:user:create --simple"
         return 0
     fi
 
     printf '\n'
     if confirm "Create your DMARCo account now?"; then
-        compose exec php bin/console app:user:create < /dev/tty || {
-            warn "Account creation failed. Retry with: docker compose exec php bin/console app:user:create"
+        compose exec php bin/console app:user:create --simple < /dev/tty || {
+            warn "Account creation failed. Retry with: docker compose exec php bin/console app:user:create --simple"
             return 0
         }
         ACCOUNT_CREATED=1
@@ -374,8 +377,8 @@ print_summary() {
     cat <<- EOF
 
 		   The TXT record is what lets other domains send their reports here.
-		   Without it, providers stop sending reports for every domain that is
-		   not under ${REPORT_DOMAIN}.
+		   Without it, providers stop sending reports for every domain outside
+		   ${REPORT_DOMAIN}.
 
 		   Port 25 must reach this server. Some hosting providers block it by
 		   default and unblock it on request.
@@ -400,15 +403,16 @@ print_summary() {
 
 			${C_BOLD}Create your account${C_RESET}
 
-			   docker compose exec php bin/console app:user:create
+			   docker compose exec php bin/console app:user:create --simple
 		EOF
     fi
 
     cat <<- EOF
 
-		${C_DIM}New accounts have to confirm their email address, and every sign-in sends a
-		two-factor code by email, so check that DMARCo can send mail. Full
-		documentation: https://github.com/${REPO}${C_RESET}
+		${C_DIM}New accounts have to confirm their email address, and every sign-in needs a
+		two-factor code, sent by email until you switch to an authenticator app, so
+		check that DMARCo can send mail. Full documentation:
+		https://github.com/${REPO}${C_RESET}
 
 	EOF
 }

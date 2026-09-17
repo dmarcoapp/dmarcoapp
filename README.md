@@ -24,7 +24,7 @@
 DMARC reports tell you which servers send mail using your domain, and whether
 that mail passes SPF and DKIM. Mailbox providers send those reports as XML
 attachments, every day, from every provider, for every domain. DMARCo collects
-them, parses them and turns them into something you can actually read: senders,
+them, parses them, and turns them into something you can actually read: senders,
 volumes, authentication results, and the traffic you did not expect.
 
 Everything runs on your own machine. No third-party service ever sees your
@@ -36,13 +36,15 @@ DMARC reports (email)  ->  DMARCo  ->  dashboard
 
 ## What you get
 
-- A dashboard of report volume, pass rates, and trends over time
-- Per-domain views of every sending source, with alignment and policy results
-- Report browsing with filtering, sorting, record details, and raw XML access
-- Sender, reporting organization, and country breakdowns
+- A dashboard of report volume, pass rates, blocked threats, and the trend
+  behind each one
+- Top senders, top offenders, reporting organizations, and source countries
+- Per-domain pages with the published DMARC record, a protection level, and
+  DKIM and SPF alignment
+- Report browsing with filtering, sorting, record details, and the raw XML
 - A blocklist for reporters you do not care about
 - Accounts with email verification, two-factor authentication, and password reset
-- Automatic retention cleanup
+- Automatic deletion of reports past the retention window
 
 ## How it works
 
@@ -64,10 +66,10 @@ One `docker compose` stack runs all of it:
 
 - A Linux server with [Docker](https://docs.docker.com/engine/install/) and
   Docker Compose v2, on x86-64 or ARM64
-- 2 CPU cores and 4 GB of memory is comfortable for a handful of domains
-- A public IPv4 address, with ports `80`, `443` and `25` reaching the server.
-  Many providers block outbound and inbound port `25` until you ask them to
-  open it, because it is a mail port
+- Two CPU cores and 4 GB of memory are enough for a handful of domains
+- A public IPv4 address, with ports `80`, `443`, and `25` reaching the server.
+  Many providers block port `25` in both directions until you ask them to open
+  it
 - A domain you can add DNS records to
 - An SMTP account for outgoing mail. DMARCo emails verification links and
   two-factor codes, so sign-in does not work without one. Any provider works,
@@ -95,9 +97,9 @@ cp .env.example .env
 nano .env
 ```
 
-Fill in the domains, the mailer DSN, and replace every `generated` value with a
-long random string, for example from `openssl rand -hex 24`. Then write the
-secrets the mail gateway reads from files, and start everything:
+Fill in the domains and the mailer DSN, and replace every `generated` value with
+a long random string, for example from `openssl rand -hex 24`. Then write the
+secrets the mail gateway reads from files:
 
 ```bash
 mkdir -p secrets && chmod 700 secrets
@@ -105,15 +107,24 @@ printf '%s\n' "$(grep '^WEBHOOK_SECRET=' .env | cut -d= -f2-)" > secrets/webhook
 printf '%s\n' "$(grep '^S3_ACCESS_KEY=' .env | cut -d= -f2-)" > secrets/s3_access_key.txt
 printf '%s\n' "$(grep '^S3_SECRET_KEY=' .env | cut -d= -f2-)" > secrets/s3_secret_key.txt
 printf 'unused\n' > secrets/cloudflare_token.txt
-chmod 600 secrets/*.txt
+chmod 644 secrets/*.txt
+```
 
+Docker mounts those files into the containers keeping the owner and mode they
+have here, and the mail processor runs as an unprivileged user that is not you,
+so `0600` would lock it out. The `0700` directory is what keeps other users on
+the host away from the files.
+
+Now start everything:
+
+```bash
 docker compose up -d --wait
 docker compose exec php bin/console lexik:jwt:generate-keypair --skip-if-exists
-docker compose exec php bin/console app:user:create
+docker compose exec php bin/console app:user:create --simple
 ```
 
 `--wait` returns once every container reports healthy, which on the first run
-includes the database migrations.
+means waiting for the database migrations.
 
 ## DNS records
 
@@ -137,10 +148,10 @@ sent to `REPORT_DOMAIN` is rejected. A dedicated subdomain such as
 
 ### Why the `_report._dmarc` record
 
-DMARC does not let a domain send its reports to an address on someone else's
-domain without that domain agreeing to it, which is what the `TXT` record above
-is. Without it, a provider that follows the spec, which is all the large ones,
-quietly stops sending you reports for every domain outside `REPORT_DOMAIN`.
+A domain may not send its DMARC reports to an address on someone else's domain
+unless that domain agrees to it, and the `TXT` record above is that agreement.
+Without it, every provider that follows the spec, which is all the large ones,
+quietly stops sending you reports for domains outside `REPORT_DOMAIN`.
 
 The wildcard covers every domain you will ever add. To be more restrictive,
 publish one record per monitored domain instead:
@@ -149,9 +160,9 @@ publish one record per monitored domain instead:
 | --- | --- | --- |
 | `TXT` | `example.net._report._dmarc.dmarc.example.com` | `v=DMARC1` |
 
-The record is only unnecessary when the monitored domain and `REPORT_DOMAIN`
-sit under the same registered domain, such as watching `example.com` with
-reports arriving at `dmarc.example.com`.
+You can skip the record only when the monitored domain and `REPORT_DOMAIN` sit
+under the same registered domain, such as watching `example.com` with reports
+arriving at `dmarc.example.com`.
 
 The wildcard also lets strangers aim their reports at your server. They cannot
 read anything of yours, and mail to an address that belongs to no account is
@@ -171,8 +182,8 @@ If the domain is not a subdomain of `REPORT_DOMAIN`, it also needs the
 wildcard record already covers.
 
 `p=none` only asks for reports and changes nothing about how your mail is
-delivered. Reports start arriving within a day or two, and providers send them
-once every 24 hours, so the first dashboard numbers take a little patience.
+delivered. Providers send them once every 24 hours, so the first numbers appear
+a day or two after the record goes live.
 
 Once you can see who sends mail as you, and everything legitimate passes, you
 can move the policy to `p=quarantine` and then `p=reject`.
@@ -189,7 +200,7 @@ apply it.
 | `CORS_ALLOW_ORIGIN` | Browser origins allowed to call the API, as a regular expression |
 | `REPORT_DOMAIN` | Domain reports are sent to, the one with the `MX` record |
 | `SMTP_HOSTNAME` | Public hostname of this mail server |
-| `SMTP_TLS_MODE` | Certificate for inbound SMTP: `self-signed`, `real`, `external` or `disabled` |
+| `SMTP_TLS_MODE` | Certificate for inbound SMTP: `self-signed`, `real`, `external`, or `disabled` |
 | `MAILER_DSN` | SMTP account used for outgoing mail |
 | `APP_EMAIL_SENDER_ADDRESS` | Sender address of DMARCo's own emails |
 | `APP_REGISTRATION_ENABLED`, `DASHBOARD_DISABLE_REGISTRATION` | Public sign-up, off by default |
@@ -203,7 +214,7 @@ Public registration is off by default, which is usually what you want on your
 own server. Add people from the command line:
 
 ```bash
-docker compose exec php bin/console app:user:create
+docker compose exec php bin/console app:user:create --simple
 ```
 
 To open registration instead, set `APP_REGISTRATION_ENABLED=true` and
@@ -212,7 +223,7 @@ To open registration instead, set `APP_REGISTRATION_ENABLED=true` and
 ### Turning off virus scanning
 
 `CLAMAV_SCAN_ENABLED=false` skips the scan but keeps the scanner running, and
-ClamAV holds its signature database in memory, roughly 1.5 GB of it. To remove
+ClamAV holds roughly 1.5 GB of signature database in memory either way. To drop
 the container as well on a small server, create `compose.override.yaml` next to
 `compose.yaml`:
 
@@ -225,7 +236,7 @@ services:
 ```
 
 Then set `CLAMAV_SCAN_ENABLED=false` in `.env` and run `docker compose up -d
---remove-orphans`. Attachments are still size-checked, extension-checked and
+--remove-orphans`. Attachments are still size-checked, extension-checked, and
 schema-validated, but no longer scanned for malware.
 
 ### A publicly trusted certificate for inbound mail
@@ -328,16 +339,15 @@ and `docker compose logs <name>` shows why.
 
 Something broken, unclear, or missing? Open an issue here, in this repository:
 
-- [Report a problem](https://github.com/dmarcoapp/dmarcoapp/issues/new/choose)
-  — installation, upgrades, mail delivery, the dashboard, the API, anything
+- [Report a problem](https://github.com/dmarcoapp/dmarcoapp/issues/new/choose):
+  installation, upgrades, mail delivery, the dashboard, the API, anything
 - [Suggest a feature](https://github.com/dmarcoapp/dmarcoapp/issues/new/choose)
 
-This is the tracker for every part of DMARCo, so you never have to work out
-which component a problem belongs to. Include the output of `docker compose ps`
-and the relevant `docker compose logs`, and leave out anything sensitive.
+Include the output of `docker compose ps` and the relevant `docker compose
+logs`, and leave out anything sensitive.
 
-Found a security vulnerability? Please do not open a public issue — see
-[`SECURITY.md`](SECURITY.md).
+Found a security vulnerability? Please do not open a public issue. See
+[`SECURITY.md`](SECURITY.md) instead.
 
 Want to contribute code? See [`CONTRIBUTING.md`](CONTRIBUTING.md).
 

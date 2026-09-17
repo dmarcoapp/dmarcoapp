@@ -6,7 +6,7 @@ body:
     attributes:
       value: |
         This tracker covers all of DMARCo, so report the problem here whichever
-        component it comes from. Please remove passwords, secrets and real
+        component it comes from. Please remove passwords, secrets, and real
         report data from anything you paste.
 
   - type: dropdown

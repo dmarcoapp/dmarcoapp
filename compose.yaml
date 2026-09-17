@@ -26,7 +26,7 @@ x-backend-environment: &backend-environment
   S3_SECRET_KEY: ${S3_SECRET_KEY:?Set S3_SECRET_KEY in .env}
 
 services:
-  # ---------------------------------------------------------------- web entry
+  # ----------------------------------------------------------------- web entry
   caddy:
     image: caddy:2-alpine
     restart: unless-stopped
@@ -53,7 +53,7 @@ services:
       DMARCO_DISABLE_REGISTRATION: ${DASHBOARD_DISABLE_REGISTRATION:-true}
       DMARCO_MOCK_MODE: "false"
 
-  # ------------------------------------------------------------------ backend
+  # ------------------------------------------------------------------- backend
   php:
     image: *backend-image
     restart: unless-stopped
@@ -100,7 +100,7 @@ services:
       php:
         condition: service_started
 
-  # ---------------------------------------------------------------- inbound mail
+  # -------------------------------------------------------------- inbound mail
   postfix:
     image: ghcr.io/dmarcoapp/mail-inbound/postfix:${MAIL_INBOUND_VERSION:-latest}
     restart: unless-stopped
@@ -166,7 +166,7 @@ services:
       timeout: 10s
       retries: 3
 
-  # ------------------------------------- publicly trusted MX certificate (opt-in)
+  # ---------------------------------- publicly trusted MX certificate (opt-in)
   certbot:
     image: ghcr.io/dmarcoapp/mail-inbound/certbot:${MAIL_INBOUND_VERSION:-latest}
     profiles:
