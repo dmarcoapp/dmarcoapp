@@ -205,6 +205,7 @@ apply it.
 | `APP_EMAIL_SENDER_ADDRESS` | Sender address of DMARCo's own emails |
 | `APP_REGISTRATION_ENABLED`, `DASHBOARD_DISABLE_REGISTRATION` | Public sign-up, off by default |
 | `APP_REPORT_RETENTION_DAYS` | How long processed reports are kept, `0` to keep them forever |
+| `S3_RETENTION_DAYS` | How long the raw report emails are kept in object storage, `0` to keep them forever |
 | `CLAMAV_SCAN_ENABLED` | Virus scanning of attachments |
 | `BACKEND_VERSION`, `DASHBOARD_VERSION`, `MAIL_INBOUND_VERSION` | Image tags, pin these for reproducible upgrades |
 
