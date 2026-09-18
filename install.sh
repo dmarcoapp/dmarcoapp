@@ -419,6 +419,7 @@ sync_credentials() {
         warn "If this server still holds data from an earlier install, put that install's POSTGRES_PASSWORD back in ${INSTALL_DIR}/.env, or delete the old data with: cd ${INSTALL_DIR} && docker compose down -v"
     fi
 
+    # shellcheck disable=SC2016  # DMARCO_USER and DMARCO_PASSWORD expand in the container, not here
     if [ -z "${RABBITMQ_PASSWORD:-}" ]; then
         warn "There is no RABBITMQ_PASSWORD to set."
     elif compose exec -T rabbitmq rabbitmqctl -q change_password "$broker_user" "$RABBITMQ_PASSWORD" > /dev/null 2>&1; then
