@@ -198,6 +198,7 @@ apply it.
 | `APP_DOMAIN` | Domain the dashboard and API are served on |
 | `ACME_EMAIL` | Address for your Let's Encrypt account |
 | `CORS_ALLOW_ORIGIN` | Browser origins allowed to call the API, as a regular expression |
+| `CADDY_SITE_SCHEME` | How Caddy listens, `http` when something else terminates TLS |
 | `REPORT_DOMAIN` | Domain reports are sent to, the one with the `MX` record |
 | `SMTP_HOSTNAME` | Public hostname of this mail server |
 | `SMTP_TLS_MODE` | Certificate for inbound SMTP: `self-signed`, `real`, `external`, or `disabled` |
@@ -267,6 +268,48 @@ services:
 
 Use `SMTP_TLS_CHAIN_FILE` in `.env` if you would rather mount it elsewhere.
 Postfix reads the file at startup, so restart it after a renewal.
+
+### Behind a proxy or a tunnel
+
+If something in front of DMARCo already terminates TLS, an existing nginx or
+Traefik, a load balancer, or a tunnel such as Cloudflare's, then Caddy should
+neither bind ports `80` and `443` nor ask for a certificate of its own.
+
+In `.env`, tell Caddy to serve plain HTTP, and leave the address browsers use
+alone:
+
+```bash
+CADDY_SITE_SCHEME=http
+```
+
+`APP_SCHEME` stays `https`, because that is what browsers reach. The backend is
+told the same, so it keeps marking cookies secure.
+
+Then bind Caddy to a local port instead of `80` and `443`, in a
+`compose.override.yaml` next to `compose.yaml`:
+
+```yaml
+services:
+  caddy:
+    ports: !override
+      - "127.0.0.1:8080:80"
+```
+
+`!override` replaces the published ports instead of adding to them, and needs
+Docker Compose 2.24 or newer. Run `docker compose up -d` to apply it, then point
+your proxy at `http://127.0.0.1:8080`. A proxy that runs in Docker itself can
+skip the published port and join this stack's network instead, where the whole
+application answers as `caddy:80`.
+
+Caddy serves only the site that matches `APP_DOMAIN`, so the proxy has to pass
+that name through. Traefik and most tunnels do so without being asked, while
+nginx needs `proxy_set_header Host $host;`, because it otherwise sends the
+address of the upstream.
+
+Two things stay as they are. Port `25` still has to reach this server directly,
+because no HTTP proxy or tunnel carries SMTP. And a firewall that keeps `80` and
+`443` closed is fine, the publicly trusted MX certificate above included,
+because that one is issued over DNS rather than over a port.
 
 ## Running it
 

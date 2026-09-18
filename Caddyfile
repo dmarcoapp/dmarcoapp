@@ -2,13 +2,21 @@
 #
 # Serves the dashboard on APP_DOMAIN and proxies /api/* to the backend, so the
 # whole application runs on a single domain with a single certificate.
-# Certificates are obtained and renewed automatically by Caddy.
+# Certificates are obtained and renewed automatically, unless Caddy is told to
+# serve plain HTTP because something in front of it terminates TLS instead.
+#
+# Two settings decide how this is served. CADDY_SITE_SCHEME is how Caddy itself
+# listens: https, the default, means it obtains a certificate, and http means it
+# serves plain HTTP and asks for nothing, which is what a local test or a proxy
+# in front of it needs. APP_SCHEME is the address browsers use, which is what
+# the backend has to be told, and the two differ whenever something else
+# terminates TLS. See "Behind a proxy or a tunnel" in the README.
 
 {
 	email {$ACME_EMAIL}
 }
 
-{$APP_DOMAIN} {
+{$CADDY_SITE_SCHEME:https}://{$APP_DOMAIN} {
 	encode zstd gzip
 
 	header {
@@ -29,6 +37,10 @@
 	handle_path /api/* {
 		reverse_proxy php:80 {
 			header_up X-Forwarded-Prefix /api
+			# Caddy would otherwise report the scheme of its own hop, which is
+			# plain HTTP when something in front of it terminated the TLS. The
+			# backend marks cookies secure by what it is told here.
+			header_up X-Forwarded-Proto {$APP_SCHEME:https}
 		}
 	}
 

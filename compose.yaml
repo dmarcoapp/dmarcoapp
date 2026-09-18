@@ -33,6 +33,11 @@ services:
     environment:
       ACME_EMAIL: ${ACME_EMAIL:?Set ACME_EMAIL in .env}
       APP_DOMAIN: ${APP_DOMAIN}
+      APP_SCHEME: ${APP_SCHEME:-https}
+      # How Caddy listens, which follows APP_SCHEME unless it is set on its own.
+      # Serving plain HTTP behind a proxy that terminates TLS is the case where
+      # the two differ: http here, https in APP_SCHEME.
+      CADDY_SITE_SCHEME: ${CADDY_SITE_SCHEME:-${APP_SCHEME:-https}}
     ports:
       - "80:80"
       - "443:443"
