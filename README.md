@@ -27,8 +27,10 @@ attachments, every day, from every provider, for every domain. DMARCo collects
 them, parses them, and turns them into something you can actually read: senders,
 volumes, authentication results, and the traffic you did not expect.
 
-Everything runs on your own machine. No third-party service ever sees your
-report data.
+Everything runs on your own machine, and no third-party service receives your
+reports. DMARCo does look up the IP addresses that send mail as you, at
+ipwho.is and the regional internet registries, to show who owns them and where
+they are. You can [turn that off](#configuration).
 
 ```text
 DMARC reports (email)  ->  DMARCo  ->  dashboard
@@ -206,6 +208,7 @@ apply it.
 | `APP_EMAIL_SENDER_ADDRESS` | Sender address of DMARCo's own emails |
 | `APP_REGISTRATION_ENABLED`, `DASHBOARD_DISABLE_REGISTRATION` | Public sign-up, off by default |
 | `APP_REPORT_RETENTION_DAYS` | How long processed reports are kept, `0` to keep them forever |
+| `APP_IP_LOOKUP_ENABLED` | Sender IP lookups at ipwho.is and the regional internet registries, `false` to keep the addresses on your server |
 | `S3_RETENTION_DAYS` | How long the raw report emails are kept in object storage, `0` to keep them forever |
 | `CLAMAV_SCAN_ENABLED` | Virus scanning of attachments |
 | `BACKEND_VERSION`, `DASHBOARD_VERSION`, `MAIL_INBOUND_VERSION` | Image tags, pin these for reproducible upgrades |
@@ -363,6 +366,17 @@ dig +short TXT '*._report._dmarc.dmarc.example.com'
 It should print `"v=DMARC1"`. Then check that port `25` reaches the server, from
 another machine: `nc -vz dmarc.example.com 25`. Providers often block it by
 default. Finally look at `docker compose logs postfix processor`.
+
+**Reports stopped after a configuration change.** When the backend refuses
+report email for a reason that waiting cannot fix, such as a `WEBHOOK_SECRET`
+in `.env` that no longer matches `secrets/webhook_secret.txt`, the processor
+keeps each refused report instead of dropping it. So does a report that still
+fails after about five days of retries. `docker compose logs processor` names
+the cause. Fix it, then send the kept reports through again:
+
+```bash
+docker compose exec processor npm run replay-dead-letter
+```
 
 **I never got the verification email.** DMARCo can only send mail if
 `MAILER_DSN` is right. Look for errors with `docker compose logs worker`, fix
