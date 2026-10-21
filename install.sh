@@ -235,22 +235,30 @@ fetch_stack() {
 
 collect_configuration() {
     info "Configuration"
-    printf '%sDMARCo needs a domain that points to this server, and an SMTP account it\ncan send verification and two-factor emails from.%s\n\n' "$C_DIM" "$C_RESET"
+    printf '%sDMARCo needs a domain that points to this server.%s\n\n' "$C_DIM" "$C_RESET"
 
     ask APP_DOMAIN "Domain for the dashboard and API" ""
     ask ACME_EMAIL "Email address for Let's Encrypt" ""
     ask REPORT_DOMAIN "Domain your DMARC reports are sent to, which must not receive other email" "$APP_DOMAIN"
     check_report_domain
     ask SMTP_HOSTNAME "Public hostname of this mail server" "$APP_DOMAIN"
-    ask APP_EMAIL_SENDER_ADDRESS "Sender address for DMARCo emails" "no-reply@${APP_DOMAIN}"
 
+    # Mail only carries notifications, so an unattended install goes without it
+    # unless MAILER_DSN is passed in, and it can be added to .env any time.
     if [ -z "${MAILER_DSN:-}" ]; then
-        printf '\n'
-        ask MAIL_HOST "SMTP server for outgoing email" ""
-        ask MAIL_PORT "SMTP port" "587"
-        ask MAIL_USER "SMTP username" ""
-        ask_secret MAIL_PASSWORD "SMTP password"
-        MAILER_DSN="smtp://$(urlencode "$MAIL_USER"):$(urlencode "$MAIL_PASSWORD")@${MAIL_HOST}:${MAIL_PORT}"
+        printf '\n%sDMARCo can email you a weekly overview and sign-in alerts. That needs an\nSMTP account, and everything else works without one.%s\n' "$C_DIM" "$C_RESET"
+        if [ -z "${DMARCO_YES:-}" ] && confirm "Set up outgoing email now?"; then
+            ask MAIL_HOST "SMTP server for outgoing email" ""
+            ask MAIL_PORT "SMTP port" "587"
+            ask MAIL_USER "SMTP username" ""
+            ask_secret MAIL_PASSWORD "SMTP password"
+            MAILER_DSN="smtp://$(urlencode "$MAIL_USER"):$(urlencode "$MAIL_PASSWORD")@${MAIL_HOST}:${MAIL_PORT}"
+        else
+            MAILER_DSN='null://null'
+        fi
+    fi
+    if [ "$MAILER_DSN" != 'null://null' ]; then
+        ask APP_EMAIL_SENDER_ADDRESS "Sender address for DMARCo emails" "no-reply@${APP_DOMAIN}"
     fi
 
     APP_SCHEME="${APP_SCHEME:-https}"
@@ -357,7 +365,7 @@ write_configuration() {
 		SMTP_TLS_MODE=${SMTP_TLS_MODE:-self-signed}
 
 		MAILER_DSN=${MAILER_DSN}
-		APP_EMAIL_SENDER_ADDRESS=${APP_EMAIL_SENDER_ADDRESS}
+		APP_EMAIL_SENDER_ADDRESS=${APP_EMAIL_SENDER_ADDRESS:-no-reply@${APP_DOMAIN}}
 
 		APP_SECRET=${APP_SECRET}
 		WEBHOOK_SECRET=${WEBHOOK_SECRET}
@@ -366,8 +374,6 @@ write_configuration() {
 		S3_ACCESS_KEY=${S3_ACCESS_KEY}
 		S3_SECRET_KEY=${S3_SECRET_KEY}
 
-		APP_REGISTRATION_ENABLED=${APP_REGISTRATION_ENABLED:-false}
-		DASHBOARD_DISABLE_REGISTRATION=${DASHBOARD_DISABLE_REGISTRATION:-true}
 		APP_REPORT_RETENTION_DAYS=${APP_REPORT_RETENTION_DAYS:-365}
 		APP_IP_LOOKUP_ENABLED=${APP_IP_LOOKUP_ENABLED:-true}
 		S3_RETENTION_DAYS=${S3_RETENTION_DAYS:-30}
@@ -481,14 +487,14 @@ configure_application() {
     fi
 
     if ! has_tty; then
-        warn "No terminal available. Create your account with: docker compose exec php bin/console app:user:create --simple"
+        warn "No terminal available. Create your account with: docker compose exec php bin/console app:user:create"
         return 0
     fi
 
     printf '\n'
     if confirm "Create your DMARCo account now?"; then
-        compose exec php bin/console app:user:create --simple < /dev/tty || {
-            warn "Account creation failed. Retry with: docker compose exec php bin/console app:user:create --simple"
+        compose exec php bin/console app:user:create < /dev/tty || {
+            warn "Account creation failed. Retry with: docker compose exec php bin/console app:user:create"
             return 0
         }
         ACCOUNT_CREATED=1
@@ -555,16 +561,14 @@ print_summary() {
 
 			${C_BOLD}Create your account${C_RESET}
 
-			   docker compose exec php bin/console app:user:create --simple
+			   docker compose exec php bin/console app:user:create
 		EOF
     fi
 
     cat <<- EOF
 
-		${C_DIM}New accounts have to confirm their email address, and every sign-in needs a
-		two-factor code, sent by email until you switch to an authenticator app, so
-		check that DMARCo can send mail. Full documentation:
-		https://github.com/${REPO}${C_RESET}
+		${C_DIM}Two-factor authentication with an authenticator app is in your profile.
+		Full documentation: https://github.com/${REPO}${C_RESET}
 
 	EOF
 }

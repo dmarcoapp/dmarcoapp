@@ -4,18 +4,22 @@ x-backend-image: &backend-image ghcr.io/dmarcoapp/backend:${BACKEND_VERSION:-lat
 
 x-backend-environment: &backend-environment
   APP_DMARC_AGGREGATE_REPORT_EMAIL_RECEIVER_DOMAIN: ${REPORT_DOMAIN:?Set REPORT_DOMAIN in .env}
-  APP_EMAIL_SENDER_ADDRESS: ${APP_EMAIL_SENDER_ADDRESS:?Set APP_EMAIL_SENDER_ADDRESS in .env}
+  APP_EMAIL_SENDER_ADDRESS: ${APP_EMAIL_SENDER_ADDRESS:-no-reply@${APP_DOMAIN}}
   APP_FRONTEND_URL: ${APP_SCHEME:-https}://${APP_DOMAIN:?Set APP_DOMAIN in .env}
   APP_INBOUND_REPORT_EMAIL_WEBHOOK_SECRET: ${WEBHOOK_SECRET:?Set WEBHOOK_SECRET in .env}
   APP_IP_LOOKUP_ENABLED: ${APP_IP_LOOKUP_ENABLED:-true}
-  APP_REGISTRATION_ENABLED: ${APP_REGISTRATION_ENABLED:-false}
+  # Backends before 0.3 had public sign-up and read this. It keeps a pinned
+  # older image closed, and newer ones ignore it.
+  APP_REGISTRATION_ENABLED: "false"
   APP_REPORT_RETENTION_DAYS: ${APP_REPORT_RETENTION_DAYS:-365}
   APP_SECRET: ${APP_SECRET:?Set APP_SECRET in .env}
   CORS_ALLOW_ORIGIN: ${CORS_ALLOW_ORIGIN:?Set CORS_ALLOW_ORIGIN in .env}
   DATABASE_URL: postgresql://${POSTGRES_USER:-dmarco}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@database:5432/${POSTGRES_DB:-dmarco}?serverVersion=${POSTGRES_VERSION:-16}&charset=utf8
   DEFAULT_URI: ${APP_SCHEME:-https}://${APP_DOMAIN}
   LOCK_DSN: redis://redis
-  MAILER_DSN: ${MAILER_DSN:?Set MAILER_DSN in .env}
+  # Outgoing mail only carries notifications, so without an SMTP account the
+  # null transport accepts them and sends nothing.
+  MAILER_DSN: ${MAILER_DSN:-null://null}
   MESSENGER_ASYNC_HIGH_TRANSPORT_DSN: amqp://${RABBITMQ_USER:-dmarco}:${RABBITMQ_PASSWORD:?Set RABBITMQ_PASSWORD in .env}@rabbitmq:5672/%2f/messages
   MESSENGER_ASYNC_LOW_TRANSPORT_DSN: amqp://${RABBITMQ_USER:-dmarco}:${RABBITMQ_PASSWORD}@rabbitmq:5672/%2f/messages
   REDIS_DSN: redis://redis
@@ -56,7 +60,8 @@ services:
     restart: unless-stopped
     environment:
       DMARCO_API_BASE_URL: /api
-      DMARCO_DISABLE_REGISTRATION: ${DASHBOARD_DISABLE_REGISTRATION:-true}
+      # Hides the sign-up link of a pinned dashboard before 0.3.
+      DMARCO_DISABLE_REGISTRATION: "true"
       DMARCO_MOCK_MODE: "false"
 
   # ------------------------------------------------------------------- backend

@@ -45,7 +45,9 @@ DMARC reports (email)  ->  DMARCo  ->  dashboard
   DKIM and SPF alignment
 - Report browsing with filtering, sorting, record details, and the raw XML
 - A blocklist for reporters you do not care about
-- Accounts with email verification, two-factor authentication, and password reset
+- One account for you, with optional two-factor authentication by authenticator
+  app
+- Optional email notifications: a weekly overview and sign-in alerts
 - Automatic deletion of reports past the retention window
 
 ## How it works
@@ -73,9 +75,8 @@ One `docker compose` stack runs all of it:
   Many providers block port `25` in both directions until you ask them to open
   it
 - A domain you can add DNS records to
-- An SMTP account for outgoing mail. DMARCo emails verification links and
-  two-factor codes, so sign-in does not work without one. Any provider works,
-  including a free tier
+- Optional: an SMTP account for outgoing mail, if you want the notification
+  emails. Any provider works, including a free tier
 
 ## Install
 
@@ -83,9 +84,10 @@ One `docker compose` stack runs all of it:
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/dmarcoapp/dmarcoapp/main/install.sh)"
 ```
 
-The installer checks your Docker setup, asks for your domain and SMTP details,
-generates every password and secret, starts the stack, and creates your
-account. It takes a couple of minutes, most of it spent pulling images.
+The installer checks your Docker setup, asks for your domain and, if you want
+notification emails, an SMTP account. It generates every password and secret,
+starts the stack, and creates your account. It takes a couple of minutes, most
+of it spent pulling images.
 
 Prefer to read before you run? The script is [install.sh](install.sh), and the
 manual route is below.
@@ -99,8 +101,9 @@ cp .env.example .env
 nano .env
 ```
 
-Fill in the domains and the mailer DSN, and replace every `generated` value with
-a long random string, for example from `openssl rand -hex 24`. Then write the
+Fill in the domains, and the mailer DSN if you want notification emails. Replace
+every `generated` value with a long random string, for example from
+`openssl rand -hex 24`. Then write the
 secrets the mail gateway reads from files:
 
 ```bash
@@ -122,7 +125,7 @@ Now start everything:
 ```bash
 docker compose up -d --wait
 docker compose exec php bin/console lexik:jwt:generate-keypair --skip-if-exists
-docker compose exec php bin/console app:user:create --simple
+docker compose exec php bin/console app:user:create
 ```
 
 `--wait` returns once every container reports healthy, which on the first run
@@ -204,26 +207,27 @@ apply it.
 | `REPORT_DOMAIN` | Domain reports are sent to, the one with the `MX` record |
 | `SMTP_HOSTNAME` | Public hostname of this mail server |
 | `SMTP_TLS_MODE` | Certificate for inbound SMTP: `self-signed`, `real`, `external`, or `disabled` |
-| `MAILER_DSN` | SMTP account used for outgoing mail |
-| `APP_EMAIL_SENDER_ADDRESS` | Sender address of DMARCo's own emails |
-| `APP_REGISTRATION_ENABLED`, `DASHBOARD_DISABLE_REGISTRATION` | Public sign-up, off by default |
+| `MAILER_DSN` | SMTP account for notification emails, none by default |
+| `APP_EMAIL_SENDER_ADDRESS` | Sender address of those emails |
 | `APP_REPORT_RETENTION_DAYS` | How long processed reports are kept, `0` to keep them forever |
 | `APP_IP_LOOKUP_ENABLED` | Sender IP lookups at ipwho.is and the regional internet registries, `false` to keep the addresses on your server |
 | `S3_RETENTION_DAYS` | How long the raw report emails are kept in object storage, `0` to keep them forever |
 | `CLAMAV_SCAN_ENABLED` | Virus scanning of attachments |
 | `BACKEND_VERSION`, `DASHBOARD_VERSION`, `MAIL_INBOUND_VERSION` | Image tags, pin these for reproducible upgrades |
 
-### Accounts
+### Your account
 
-Public registration is off by default, which is usually what you want on your
-own server. Add people from the command line:
+DMARCo has no sign-up page. Accounts are made on the server, which is also
+where you fix one:
 
 ```bash
-docker compose exec php bin/console app:user:create --simple
+docker compose exec php bin/console app:user:create              # create it
+docker compose exec php bin/console app:user:reset-password      # forgot the password
+docker compose exec php bin/console app:user:disable-two-factor  # lost the authenticator app
 ```
 
-To open registration instead, set `APP_REGISTRATION_ENABLED=true` and
-`DASHBOARD_DISABLE_REGISTRATION=false`.
+None of this needs outgoing mail. Two-factor authentication is off until you
+turn it on in your profile, with any authenticator app.
 
 ### Turning off virus scanning
 
@@ -378,13 +382,9 @@ the cause. Fix it, then send the kept reports through again:
 docker compose exec processor npm run replay-dead-letter
 ```
 
-**I never got the verification email.** DMARCo can only send mail if
-`MAILER_DSN` is right. Look for errors with `docker compose logs worker`, fix
-`.env`, run `docker compose up -d`, and resend:
-
-```bash
-docker compose exec php bin/console app:user:verification-email:resend
-```
+**No notification emails arrive.** DMARCo sends mail only when `MAILER_DSN` is
+set. Look for errors with `docker compose logs worker`, fix `.env`, and run
+`docker compose up -d`.
 
 **The site does not load over HTTPS.** Caddy needs ports `80` and `443` free,
 and `APP_DOMAIN` has to resolve to this server before it can get a certificate.
