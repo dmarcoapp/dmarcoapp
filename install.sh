@@ -268,8 +268,6 @@ collect_configuration() {
     WEBHOOK_SECRET="${WEBHOOK_SECRET:-$(generate_secret)}"
     POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-$(generate_secret)}"
     RABBITMQ_PASSWORD="${RABBITMQ_PASSWORD:-$(generate_secret)}"
-    S3_ACCESS_KEY="${S3_ACCESS_KEY:-$(generate_secret)}"
-    S3_SECRET_KEY="${S3_SECRET_KEY:-$(generate_secret)}"
 }
 
 check_report_domain() {
@@ -319,7 +317,7 @@ load_env_values() {
 # rest of them included, so nothing signed with the old ones breaks either.
 keep_existing_secrets() {
     if load_env_values APP_SECRET WEBHOOK_SECRET POSTGRES_PASSWORD \
-        RABBITMQ_PASSWORD S3_ACCESS_KEY S3_SECRET_KEY; then
+        RABBITMQ_PASSWORD; then
         info "Keeping the secrets from the existing .env, which its data depends on"
     fi
 }
@@ -371,12 +369,9 @@ write_configuration() {
 		WEBHOOK_SECRET=${WEBHOOK_SECRET}
 		POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
 		RABBITMQ_PASSWORD=${RABBITMQ_PASSWORD}
-		S3_ACCESS_KEY=${S3_ACCESS_KEY}
-		S3_SECRET_KEY=${S3_SECRET_KEY}
 
 		APP_REPORT_RETENTION_DAYS=${APP_REPORT_RETENTION_DAYS:-365}
 		APP_IP_LOOKUP_ENABLED=${APP_IP_LOOKUP_ENABLED:-true}
-		S3_RETENTION_DAYS=${S3_RETENTION_DAYS:-30}
 		CLAMAV_SCAN_ENABLED=${CLAMAV_SCAN_ENABLED:-true}
 
 		BACKEND_VERSION=${BACKEND_VERSION:-latest}
@@ -389,8 +384,9 @@ write_configuration() {
     mkdir -p "${INSTALL_DIR}/secrets"
     chmod 700 "${INSTALL_DIR}/secrets"
     printf '%s\n' "$WEBHOOK_SECRET" > "${INSTALL_DIR}/secrets/webhook_secret.txt"
-    printf '%s\n' "$S3_ACCESS_KEY" > "${INSTALL_DIR}/secrets/s3_access_key.txt"
-    printf '%s\n' "$S3_SECRET_KEY" > "${INSTALL_DIR}/secrets/s3_secret_key.txt"
+    # The credentials of the MinIO store releases before 0.4 ran, which nothing
+    # reads any more.
+    rm -f "${INSTALL_DIR}/secrets/s3_access_key.txt" "${INSTALL_DIR}/secrets/s3_secret_key.txt"
     # Only used when SMTP_TLS_MODE=real, see the README.
     [ -f "${INSTALL_DIR}/secrets/cloudflare_token.txt" ] ||
         printf 'unused\n' > "${INSTALL_DIR}/secrets/cloudflare_token.txt"
@@ -457,8 +453,10 @@ start_stack() {
         warn "The database or the message broker did not come up. Check: docker compose logs database rabbitmq"
     fi
 
+    # An install over an earlier one also clears out the services the recipe no
+    # longer has, such as the object storage releases before 0.4 ran.
     info "Starting DMARCo"
-    compose up -d ||
+    compose up -d --remove-orphans ||
         die "Could not start the stack. See what went wrong with: cd ${INSTALL_DIR} && docker compose logs"
 
     info "Waiting for the application to become ready"
@@ -553,7 +551,7 @@ print_summary() {
 		   cd ${INSTALL_DIR}
 		   docker compose ps
 		   docker compose logs -f
-		   docker compose pull && docker compose up -d     # upgrade
+		   docker compose pull && docker compose up -d --remove-orphans  # upgrade
 	EOF
 
     if [ -z "${ACCOUNT_CREATED:-}" ]; then

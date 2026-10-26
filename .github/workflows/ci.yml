@@ -20,7 +20,7 @@ jobs:
           cp .env.example .env
           sed -i 's/=generated/=ci-placeholder-value/' .env
           mkdir -p secrets
-          for secret in webhook_secret s3_access_key s3_secret_key cloudflare_token; do
+          for secret in webhook_secret cloudflare_token; do
             printf 'ci-placeholder\n' > "secrets/${secret}.txt"
           done
 

@@ -53,7 +53,7 @@ DMARC reports (email)  ->  DMARCo  ->  dashboard
 ## How it works
 
 ```text
-report email -> Postfix -> virus scan -> object storage -> backend -> PostgreSQL -> dashboard
+report email -> Postfix -> virus scan -> backend -> PostgreSQL -> dashboard
 ```
 
 One `docker compose` stack runs all of it:
@@ -64,7 +64,7 @@ One `docker compose` stack runs all of it:
 | `dashboard` | The web UI |
 | `php`, `worker` | API and background report processing |
 | `postfix`, `processor`, `clamav` | Receives report email, scans it, extracts the reports |
-| `database`, `redis`, `rabbitmq`, `minio` | Storage and queues |
+| `database`, `redis`, `rabbitmq` | Storage and queues |
 
 ## Requirements
 
@@ -103,14 +103,12 @@ nano .env
 
 Fill in the domains, and the mailer DSN if you want notification emails. Replace
 every `generated` value with a long random string, for example from
-`openssl rand -hex 24`. Then write the
-secrets the mail gateway reads from files:
+`openssl rand -hex 24`. Then write the secrets the mail gateway reads from
+files:
 
 ```bash
 mkdir -p secrets && chmod 700 secrets
 printf '%s\n' "$(grep '^WEBHOOK_SECRET=' .env | cut -d= -f2-)" > secrets/webhook_secret.txt
-printf '%s\n' "$(grep '^S3_ACCESS_KEY=' .env | cut -d= -f2-)" > secrets/s3_access_key.txt
-printf '%s\n' "$(grep '^S3_SECRET_KEY=' .env | cut -d= -f2-)" > secrets/s3_secret_key.txt
 printf 'unused\n' > secrets/cloudflare_token.txt
 chmod 644 secrets/*.txt
 ```
@@ -211,7 +209,6 @@ apply it.
 | `APP_EMAIL_SENDER_ADDRESS` | Sender address of those emails |
 | `APP_REPORT_RETENTION_DAYS` | How long processed reports are kept, `0` to keep them forever |
 | `APP_IP_LOOKUP_ENABLED` | Sender IP lookups at ipwho.is and the regional internet registries, `false` to keep the addresses on your server |
-| `S3_RETENTION_DAYS` | How long the raw report emails are kept in object storage, `0` to keep them forever |
 | `CLAMAV_SCAN_ENABLED` | Virus scanning of attachments |
 | `BACKEND_VERSION`, `DASHBOARD_VERSION`, `MAIL_INBOUND_VERSION` | Image tags, pin these for reproducible upgrades |
 
@@ -334,11 +331,35 @@ docker compose down               # stop, keeping all data
 
 ```bash
 docker compose pull
-docker compose up -d
+docker compose up -d --remove-orphans
 ```
 
-Database migrations run automatically on start. Pin the `*_VERSION` settings in
-`.env` to release tags if you would rather decide when new versions land.
+`--remove-orphans` stops the parts a newer recipe no longer has. Database
+migrations run automatically on start. Pin the `*_VERSION` settings in `.env`
+to release tags if you would rather decide when new versions land.
+
+#### From 0.3 or earlier
+
+Up to 0.3, a report went to a MinIO object store first, and the message queued
+for the backend only pointed at it. From 0.4 the report travels inside that
+message, so let the reports already on their way finish before you switch:
+
+```bash
+docker compose stop postfix processor
+docker compose exec rabbitmq rabbitmqctl list_queues name messages
+```
+
+Once `messages` shows `0`, get the new `compose.yaml`, with `git pull` in a
+clone or by running the installer again, which keeps the secrets in your `.env`.
+Then upgrade as above. Mail that arrives in the meantime is retried by the
+servers sending it. The recipe needs images from 0.4 on, so raise any
+`*_VERSION` pinned to an older release. Afterwards, remove what MinIO left
+behind:
+
+```bash
+docker volume rm dmarco_minio_data
+rm -f secrets/s3_access_key.txt secrets/s3_secret_key.txt
+```
 
 ### Backups
 
