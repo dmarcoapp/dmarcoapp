@@ -27,8 +27,11 @@ jobs:
       - name: Validate Compose config
         run: docker compose config --quiet
 
-      - name: Validate Compose config with the letsencrypt profile
-        run: COMPOSE_PROFILES=letsencrypt docker compose config --quiet
+      - name: Validate Compose config with the mail gateway
+        run: COMPOSE_PROFILES=mail-gateway docker compose config --quiet
+
+      - name: Validate Compose config with the mail gateway and its certificate
+        run: COMPOSE_PROFILES=mail-gateway,letsencrypt docker compose config --quiet
 
       - name: Validate the Caddy configuration
         run: |

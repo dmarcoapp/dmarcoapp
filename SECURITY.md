@@ -32,9 +32,11 @@ anonymous.
 
 ## Scope
 
-In scope: anything that lets someone read another account's report data, bypass
-authentication or two-factor authentication, inject or escalate through the
-inbound mail path, reach the host from a container, or forge a webhook.
+In scope: anything that lets someone read report data or settings without
+signing in, bypass authentication or two-factor authentication, recover the
+stored mailbox passwords or API keys, inject or escalate through a report, from
+a mailbox, an upload, or the mail gateway, reach the host from a container, or
+forge a webhook.
 
 Out of scope: findings that require an already-compromised server, missing
 hardening headers with no exploit path, rate limiting on a self-hosted instance

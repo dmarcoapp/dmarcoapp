@@ -10,8 +10,8 @@ documentation. The application itself is developed in three repositories:
 - [`dmarcoapp/backend`](https://github.com/dmarcoapp/backend): API, workers,
   report processing
 - [`dmarcoapp/dashboard`](https://github.com/dmarcoapp/dashboard): web UI
-- [`dmarcoapp/mail-inbound`](https://github.com/dmarcoapp/mail-inbound):
-  inbound mail gateway
+- [`dmarcoapp/mail-inbound`](https://github.com/dmarcoapp/mail-inbound): the
+  mail gateway, being retired
 
 Open the pull request against the repository that holds the code you are
 changing. **Issues, however, all belong here**, in

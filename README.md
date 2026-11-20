@@ -30,10 +30,10 @@ volumes, authentication results, and the traffic you did not expect.
 Everything runs on your own machine, and no third-party service receives your
 reports. DMARCo does look up the IP addresses that send mail as you, at
 ipwho.is and the regional internet registries, to show who owns them and where
-they are. You can [turn that off](#configuration).
+they are. You can turn that off on the Platform page.
 
 ```text
-DMARC reports (email)  ->  DMARCo  ->  dashboard
+mailbox you already have  --IMAP-->  DMARCo  ->  dashboard
 ```
 
 ## What you get
@@ -44,6 +44,9 @@ DMARC reports (email)  ->  DMARCo  ->  dashboard
 - Per-domain pages with the published DMARC record, a protection level, and
   DKIM and SPF alignment
 - Report browsing with filtering, sorting, record details, and the raw XML
+- Reports read from the mailboxes they already arrive in, over IMAP, from as
+  many mailboxes as you like
+- Optional report uploads through the API, with revocable keys
 - A blocklist for reporters you do not care about
 - One account for you, with optional two-factor authentication by authenticator
   app
@@ -53,8 +56,13 @@ DMARC reports (email)  ->  DMARCo  ->  dashboard
 ## How it works
 
 ```text
-report email -> Postfix -> virus scan -> backend -> PostgreSQL -> dashboard
+mailbox -> IMAP -> worker -> PostgreSQL -> dashboard
 ```
+
+The worker signs in to each mailbox you add, every 15 minutes unless you choose
+otherwise, and stores the reports it finds. Reports can also be uploaded through
+the API, or arrive at the [mail gateway](#mail-gateway), the older way in, which
+runs a mail server on port `25`.
 
 One `docker compose` stack runs all of it:
 
@@ -62,19 +70,21 @@ One `docker compose` stack runs all of it:
 | --- | --- |
 | `caddy` | Serves the dashboard and the API on one domain, with automatic HTTPS |
 | `dashboard` | The web UI |
-| `php`, `worker` | API and background report processing |
-| `postfix`, `processor`, `clamav` | Receives report email, scans it, extracts the reports |
+| `php`, `worker` | API, mailbox reading, and background report processing |
 | `database`, `redis`, `rabbitmq` | Storage and queues |
+| `postfix`, `processor`, `clamav` | The mail gateway, only with the `mail-gateway` profile |
 
 ## Requirements
 
 - A Linux server with [Docker](https://docs.docker.com/engine/install/) and
   Docker Compose v2, on x86-64 or ARM64
 - Two CPU cores and 4 GB of memory are enough for a handful of domains
-- A public IPv4 address, with ports `80`, `443`, and `25` reaching the server.
-  Many providers block port `25` in both directions until you ask them to open
-  it
+- A public IPv4 address, with ports `80` and `443` reaching the server
 - A domain you can add DNS records to
+- A mailbox for your DMARC reports that DMARCo can reach over IMAP, with TLS or
+  STARTTLS. A dedicated one, such as `dmarc@example.com`, keeps the reports
+  apart from other mail. Uploads through the API and the mail gateway need
+  none
 - Optional: an SMTP account for outgoing mail, if you want the notification
   emails. Any provider works, including a free tier
 
@@ -84,10 +94,15 @@ One `docker compose` stack runs all of it:
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/dmarcoapp/dmarcoapp/main/install.sh)"
 ```
 
-The installer checks your Docker setup, asks for your domain and, if you want
-notification emails, an SMTP account. It generates every password and secret,
-starts the stack, and creates your account. It takes a couple of minutes, most
-of it spent pulling images.
+The installer checks your Docker setup, asks for your domain and how reports
+should come in: from a mailbox over IMAP, through uploads with an API key, from
+the mail gateway, or several of them. It asks for what the choice needs, such as
+the mailbox's server and password, and checks that DMARCo can sign in. It
+generates every password and secret, starts the stack, and creates your
+account. It takes a couple of minutes, most of it spent pulling images.
+
+Outgoing email, report retention, and IP lookups are set afterwards, on the
+dashboard's Platform page.
 
 Prefer to read before you run? The script is [install.sh](install.sh), and the
 manual route is below.
@@ -101,24 +116,10 @@ cp .env.example .env
 nano .env
 ```
 
-Fill in the domains, and the mailer DSN if you want notification emails. Replace
-every `generated` value with a long random string, for example from
-`openssl rand -hex 24`. Then write the secrets the mail gateway reads from
-files:
-
-```bash
-mkdir -p secrets && chmod 700 secrets
-printf '%s\n' "$(grep '^WEBHOOK_SECRET=' .env | cut -d= -f2-)" > secrets/webhook_secret.txt
-printf 'unused\n' > secrets/cloudflare_token.txt
-chmod 644 secrets/*.txt
-```
-
-Docker mounts those files into the containers keeping the owner and mode they
-have here, and the mail processor runs as an unprivileged user that is not you,
-so `0600` would lock it out. The `0700` directory is what keeps other users on
-the host away from the files.
-
-Now start everything:
+Fill in the domains. Replace `generated` in `APP_SECRET`, `POSTGRES_PASSWORD`,
+and `RABBITMQ_PASSWORD` with a long random string each, for example from
+`openssl rand -hex 24`, and in `APP_ENCRYPTION_KEY` with the 64 characters of
+`openssl rand -hex 32`. Now start everything:
 
 ```bash
 docker compose up -d --wait
@@ -127,62 +128,29 @@ docker compose exec php bin/console app:user:create
 ```
 
 `--wait` returns once every container reports healthy, which on the first run
-means waiting for the database migrations.
+means waiting for the database migrations. Sign in and add your mailbox on the
+Platform page, under Report intake.
 
 ## DNS records
 
-With `APP_DOMAIN` and `REPORT_DOMAIN` both set to `dmarc.example.com`:
+The dashboard needs one record:
 
 | Type | Name | Value |
 | --- | --- | --- |
 | `A` | `dmarc.example.com` | your server's IPv4 address |
-| `MX` | `dmarc.example.com` | `10 dmarc.example.com.` |
-| `TXT` | `*._report._dmarc.dmarc.example.com` | `v=DMARC1` |
 
-The `A` record serves the dashboard. The `MX` record is what makes report email
-arrive. If you split the two, for example a UI on `dmarc.example.com` and
-reports on `reports.example.com`, add an `A` record for the value of
-`SMTP_HOSTNAME` as well.
-
-Use a domain or subdomain that receives no other email. DMARCo's `MX` record
-replaces whatever was there, and it accepts DMARC reports only, so anything else
-sent to `REPORT_DOMAIN` is rejected. A dedicated subdomain such as
-`dmarc.example.com` leaves the mail setup of `example.com` untouched.
-
-### Why the `_report._dmarc` record
-
-A domain may not send its DMARC reports to an address on someone else's domain
-unless that domain agrees to it, and the `TXT` record above is that agreement.
-Without it, every provider that follows the spec, which is all the large ones,
-quietly stops sending you reports for domains outside `REPORT_DOMAIN`.
-
-The wildcard covers every domain you will ever add. To be more restrictive,
-publish one record per monitored domain instead:
-
-| Type | Name | Value |
-| --- | --- | --- |
-| `TXT` | `example.net._report._dmarc.dmarc.example.com` | `v=DMARC1` |
-
-You can skip the record only when the monitored domain and `REPORT_DOMAIN` sit
-under the same registered domain, such as watching `example.com` with reports
-arriving at `dmarc.example.com`.
-
-The wildcard also lets strangers aim their reports at your server. They cannot
-read anything of yours, and mail to an address that belongs to no account is
-discarded, so the cost is a little wasted processing.
+The mail gateway needs more, see [Mail gateway](#mail-gateway).
 
 ## Point a domain at DMARCo
 
-Sign in, add a domain, and DMARCo shows you the mailbox address for it. Put
-that address in the domain's DMARC record:
+Put the address of the mailbox your reports go to in the domain's DMARC record:
 
 ```text
-_dmarc.example.com.  TXT  "v=DMARC1; p=none; rua=mailto:<address>@dmarc.example.com"
+_dmarc.example.com.  TXT  "v=DMARC1; p=none; rua=mailto:dmarc@example.com"
 ```
 
-If the domain is not a subdomain of `REPORT_DOMAIN`, it also needs the
-[`_report._dmarc` authorization](#why-the-_report_dmarc-record), which the
-wildcard record already covers.
+Sign in and add a domain, and DMARCo shows this record with the addresses it
+takes reports at: the report address of each mailbox, and the mail gateway's.
 
 `p=none` only asks for reports and changes nothing about how your mail is
 delivered. Providers send them once every 24 hours, so the first numbers appear
@@ -191,10 +159,187 @@ a day or two after the record goes live.
 Once you can see who sends mail as you, and everything legitimate passes, you
 can move the policy to `p=quarantine` and then `p=reject`.
 
+### The `_report._dmarc` record
+
+A domain may not send its DMARC reports to an address on someone else's domain
+unless that domain agrees to it. With reports going to `dmarc@example.com`,
+watching `example.net` needs this record on `example.com`:
+
+| Type | Name | Value |
+| --- | --- | --- |
+| `TXT` | `example.net._report._dmarc.example.com` | `v=DMARC1` |
+
+Without it, every provider that follows the spec, which is all the large ones,
+quietly stops sending you reports for `example.net`. A wildcard,
+`*._report._dmarc.example.com`, covers every domain at once. It also lets
+strangers aim their reports at the mailbox, which costs a little wasted
+processing and nothing else.
+
+You need no record when the watched domain and the report address sit under
+the same registered domain, such as watching `example.com` with reports going to
+`dmarc@example.com` or to `dmarc.example.com`. For the same reason, the report
+address has to be on a domain you can add records to: reports for your domains
+cannot go to an address at a mail provider's domain.
+
+## Report intake
+
+Mailboxes, API keys, and the mail gateway's settings are on the dashboard's
+Platform page, under Report intake. Any of them can carry reports for any of
+your domains, side by side.
+
+### Mailboxes over IMAP
+
+Add a mailbox with its server, username, and password, an app password where
+the provider offers one. DMARCo stores the password encrypted with
+`APP_ENCRYPTION_KEY` and never shows it again.
+
+- It connects with TLS or STARTTLS only, and checks the server's certificate.
+- It reads every 15 minutes by default. The first read goes back 30 days.
+- It fetches messages without marking them read, and leaves every message
+  without a report attached as it was.
+- Once a report is stored, its email is marked read, moved to another folder,
+  marked deleted, or left alone, as you choose. DMARCo never expunges.
+- At most 100 messages per read, none over 10 MB, one report attachment each.
+- After five failed reads in a row, the mailbox is tried hourly until a read
+  works again.
+
+The Test button signs in and lists the folders, and the log shows what each read
+found and skipped. The same is available on the server:
+
+```bash
+docker compose exec php bin/console app:mailbox:list
+docker compose exec php bin/console app:mailbox:test <name>
+docker compose exec php bin/console app:mailbox:poll <name>
+```
+
+### Uploads with an API key
+
+With "Take reports through the API" on, create a key on the Platform page and
+send each report file to the API, as XML or the gzip or zip it came in, up to
+10 MB:
+
+```bash
+curl --fail -X POST \
+  -H "Authorization: Bearer $DMARCO_API_KEY" \
+  -H "Content-Type: application/octet-stream" \
+  --data-binary @report.xml.gz \
+  https://dmarc.example.com/api/v1/intake/reports
+```
+
+The answer is `202` when the report is stored, `200` when it was stored before,
+and `422` with the reason when the file is not a report. Each address may make
+600 requests an hour. Only a hash of each key is kept, so a lost key is revoked
+and replaced. With the switch off, the API answers `404`.
+
+### Mail gateway
+
+The older way in, which is being retired. Postfix receives report email on port
+`25` for a domain whose `MX` record points here, ClamAV scans each attachment,
+and the reports are posted to the backend with a signed webhook. It needs port
+`25` reaching the server, which many providers block until asked, and ClamAV
+holds roughly 1.5 GB of memory.
+
+The gateway runs only with `mail-gateway` in `COMPOSE_PROFILES`. To set it up
+by hand, add to `.env`:
+
+```bash
+COMPOSE_PROFILES=mail-gateway
+MAIL_GATEWAY_DOMAIN=dmarc.example.com
+SMTP_HOSTNAME=dmarc.example.com
+```
+
+On the Platform page, under Report intake, switch on "Take reports through the
+API", set the report address domain to the same `MAIL_GATEWAY_DOMAIN`, and make
+a webhook secret. Put that secret where the gateway reads it, then start the
+gateway:
+
+```bash
+mkdir -p secrets && chmod 700 secrets
+printf '%s\n' '<the webhook secret>' > secrets/webhook_secret.txt
+chmod 644 secrets/webhook_secret.txt
+docker compose up -d
+```
+
+Docker mounts the file into the container keeping the owner and mode it has
+here, and the gateway's processor runs as an unprivileged user that is not you,
+so `0600` would lock it out. The `0700` directory is what keeps other users on
+the host away from the file. The installer does all of this when you pick the
+mail gateway.
+
+The gateway needs these DNS records, with `MAIL_GATEWAY_DOMAIN` and
+`SMTP_HOSTNAME` both `dmarc.example.com`:
+
+| Type | Name | Value |
+| --- | --- | --- |
+| `MX` | `dmarc.example.com` | `10 dmarc.example.com.` |
+| `TXT` | `*._report._dmarc.dmarc.example.com` | `v=DMARC1` |
+
+Use a domain or subdomain that receives no other email. The gateway's `MX`
+record replaces whatever was there, and it accepts DMARC reports only, so
+anything else sent to `MAIL_GATEWAY_DOMAIN` is rejected. If `SMTP_HOSTNAME`
+differs from `APP_DOMAIN`, it needs an `A` record as well.
+
+To switch the gateway off, take `mail-gateway` out of `COMPOSE_PROFILES`, then
+remove its containers, which Compose otherwise leaves running:
+
+```bash
+docker compose --profile mail-gateway rm --stop --force postfix processor clamav
+```
+
+Also remove the webhook secret on the Platform page.
+
+#### Turning off virus scanning
+
+`CLAMAV_SCAN_ENABLED=false` skips the scan but keeps the scanner running, and
+ClamAV holds its signature database in memory either way. To drop the container
+as well on a small server, create `compose.override.yaml` next to
+`compose.yaml`:
+
+```yaml
+services:
+  processor:
+    depends_on: !reset null
+  clamav:
+    profiles: !override ["disabled"]
+```
+
+`!override` needs Docker Compose 2.24 or newer. Then set
+`CLAMAV_SCAN_ENABLED=false` in `.env` and remove the `clamav` container as
+above. Attachments are still size-checked, extension-checked, and
+schema-validated, but no longer scanned for malware.
+
+#### A publicly trusted certificate for the gateway
+
+By default Postfix presents a self-signed certificate. Sending servers use
+opportunistic TLS, so they accept it, and report email is not secret. If you
+would rather serve a real certificate, and your DNS is on Cloudflare, put an
+API token that can edit DNS records for `SMTP_HOSTNAME` in
+`secrets/cloudflare_token.txt`, with the same modes as the webhook secret, then
+set in `.env`:
+
+```bash
+COMPOSE_PROFILES=mail-gateway,letsencrypt
+SMTP_TLS_MODE=real
+```
+
+Run `docker compose up -d` to apply it. With a certificate from elsewhere, set
+`SMTP_TLS_MODE=external` and mount the chain file, which must hold the private
+key followed by the full certificate chain, using a `compose.override.yaml`:
+
+```yaml
+services:
+  postfix:
+    volumes:
+      - /etc/ssl/mx/chain.pem:/certs/smtp.pem:ro
+```
+
+Use `SMTP_TLS_CHAIN_FILE` in `.env` if you would rather mount it elsewhere.
+Postfix reads the file at startup, so restart it after a renewal.
+
 ## Configuration
 
-All settings live in `.env`. Change one, then run `docker compose up -d` to
-apply it.
+`.env` holds the infrastructure. Change a setting, then run `docker compose up
+-d` to apply it.
 
 | Setting | What it is |
 | --- | --- |
@@ -202,15 +347,18 @@ apply it.
 | `ACME_EMAIL` | Address for your Let's Encrypt account |
 | `CORS_ALLOW_ORIGIN` | Browser origins allowed to call the API, as a regular expression |
 | `CADDY_SITE_SCHEME` | How Caddy listens, `http` when something else terminates TLS |
-| `REPORT_DOMAIN` | Domain reports are sent to, the one with the `MX` record |
-| `SMTP_HOSTNAME` | Public hostname of this mail server |
-| `SMTP_TLS_MODE` | Certificate for inbound SMTP: `self-signed`, `real`, `external`, or `disabled` |
-| `MAILER_DSN` | SMTP account for notification emails, none by default |
-| `APP_EMAIL_SENDER_ADDRESS` | Sender address of those emails |
-| `APP_REPORT_RETENTION_DAYS` | How long processed reports are kept, `0` to keep them forever |
-| `APP_IP_LOOKUP_ENABLED` | Sender IP lookups at ipwho.is and the regional internet registries, `false` to keep the addresses on your server |
-| `CLAMAV_SCAN_ENABLED` | Virus scanning of attachments |
+| `APP_ENCRYPTION_KEY` | Encrypts the passwords and secrets kept in the database |
+| `COMPOSE_PROFILES` | `mail-gateway` to run the mail gateway |
+| `MAIL_GATEWAY_DOMAIN`, `SMTP_HOSTNAME`, `SMTP_TLS_MODE`, `CLAMAV_SCAN_ENABLED` | The mail gateway's domain, hostname, certificate, and virus scanning |
 | `BACKEND_VERSION`, `DASHBOARD_VERSION`, `MAIL_INBOUND_VERSION` | Image tags, pin these for reproducible upgrades |
+
+Everything else is on the dashboard's Platform page and kept in the database:
+report retention, IP lookups, outgoing email and its sender address, mailboxes,
+API keys, and the mail gateway's domain and secret. Outgoing email is optional,
+and the page sends a test email to check it.
+
+Keep `APP_ENCRYPTION_KEY` with your backups. Without it, the stored passwords
+cannot be read, and each has to be entered again.
 
 ### Your account
 
@@ -225,53 +373,6 @@ docker compose exec php bin/console app:user:disable-two-factor  # lost the auth
 
 None of this needs outgoing mail. Two-factor authentication is off until you
 turn it on in your profile, with any authenticator app.
-
-### Turning off virus scanning
-
-`CLAMAV_SCAN_ENABLED=false` skips the scan but keeps the scanner running, and
-ClamAV holds roughly 1.5 GB of signature database in memory either way. To drop
-the container as well on a small server, create `compose.override.yaml` next to
-`compose.yaml`:
-
-```yaml
-services:
-  processor:
-    depends_on: !reset null
-  clamav:
-    profiles: ["disabled"]
-```
-
-Then set `CLAMAV_SCAN_ENABLED=false` in `.env` and run `docker compose up -d
---remove-orphans`. Attachments are still size-checked, extension-checked, and
-schema-validated, but no longer scanned for malware.
-
-### A publicly trusted certificate for inbound mail
-
-By default Postfix presents a self-signed certificate. Sending servers use
-opportunistic TLS, so they accept it, and report email is not secret. If you
-would rather serve a real certificate, and your DNS is on Cloudflare, put an
-API token that can edit DNS records for `SMTP_HOSTNAME` in
-`secrets/cloudflare_token.txt`, then:
-
-```bash
-echo 'COMPOSE_PROFILES=letsencrypt' >> .env
-sed -i 's/^SMTP_TLS_MODE=.*/SMTP_TLS_MODE=real/' .env
-docker compose up -d
-```
-
-With a certificate from elsewhere, set `SMTP_TLS_MODE=external` and mount the
-chain file, which must hold the private key followed by the full certificate
-chain, using a `compose.override.yaml`:
-
-```yaml
-services:
-  postfix:
-    volumes:
-      - /etc/ssl/mx/chain.pem:/certs/smtp.pem:ro
-```
-
-Use `SMTP_TLS_CHAIN_FILE` in `.env` if you would rather mount it elsewhere.
-Postfix reads the file at startup, so restart it after a renewal.
 
 ### Behind a proxy or a tunnel
 
@@ -310,10 +411,8 @@ that name through. Traefik and most tunnels do so without being asked, while
 nginx needs `proxy_set_header Host $host;`, because it otherwise sends the
 address of the upstream.
 
-Two things stay as they are. Port `25` still has to reach this server directly,
-because no HTTP proxy or tunnel carries SMTP. And a firewall that keeps `80` and
-`443` closed is fine, the publicly trusted MX certificate above included,
-because that one is issued over DNS rather than over a port.
+With the mail gateway, port `25` still has to reach this server directly,
+because no HTTP proxy or tunnel carries SMTP.
 
 ## Running it
 
@@ -322,7 +421,7 @@ cd dmarco
 
 docker compose ps                 # what is running
 docker compose logs -f            # follow everything
-docker compose logs -f processor  # follow report processing
+docker compose logs -f worker     # follow mailbox reading and report processing
 docker compose restart php        # restart one part
 docker compose down               # stop, keeping all data
 ```
@@ -338,6 +437,37 @@ docker compose up -d --remove-orphans
 migrations run automatically on start. Pin the `*_VERSION` settings in `.env`
 to release tags if you would rather decide when new versions land.
 
+#### From 0.4
+
+From 0.5, outgoing email, report retention, IP lookups, the report domain, and
+the webhook secret live in the database, and the mail gateway runs only with
+the `mail-gateway` profile. Run the installer again in the install directory
+and keep the existing `.env`:
+
+```bash
+cd dmarco
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/dmarcoapp/dmarcoapp/main/install.sh)"
+```
+
+It saves the old `.env` next to it, adds `APP_ENCRYPTION_KEY`, keeps the mail
+gateway on, starts the new version, and removes the lines whose settings the
+database took over. `REPORT_DOMAIN` becomes `MAIL_GATEWAY_DOMAIN`, which the
+gateway still reads. Delete the saved copy once everything works, because it
+holds those settings, passwords among them.
+
+By hand, get the new `compose.yaml` and add to `.env`:
+
+```bash
+APP_ENCRYPTION_KEY=<the output of openssl rand -hex 32>
+COMPOSE_PROFILES=mail-gateway
+```
+
+Then upgrade as above. The backend takes the settings over on its first start
+with the key, and the Platform page lists the lines of `.env` that can go. Once
+`REPORT_DOMAIN` is gone, set `MAIL_GATEWAY_DOMAIN` to its value. Until there is
+a key, the backend keeps reading those lines, as 0.4 did, and offers no
+mailboxes or API keys.
+
 #### From 0.3 or earlier
 
 Up to 0.3, a report went to a MinIO object store first, and the message queued
@@ -349,12 +479,9 @@ docker compose stop postfix processor
 docker compose exec rabbitmq rabbitmqctl list_queues name messages
 ```
 
-Once `messages` shows `0`, get the new `compose.yaml`, with `git pull` in a
-clone or by running the installer again, which keeps the secrets in your `.env`.
-Then upgrade as above. Mail that arrives in the meantime is retried by the
-servers sending it. The recipe needs images from 0.4 on, so raise any
-`*_VERSION` pinned to an older release. Afterwards, remove what MinIO left
-behind:
+Once `messages` shows `0`, upgrade as from 0.4 above, and raise any
+`*_VERSION` pinned to an older release. Mail that arrives in the meantime is
+retried by the servers sending it. Afterwards, remove what MinIO left behind:
 
 ```bash
 docker volume rm dmarco_minio_data
@@ -370,7 +497,8 @@ rebuild:
 docker compose exec -T database pg_dump -U dmarco dmarco | gzip > dmarco-$(date +%F).sql.gz
 ```
 
-Keep a copy of `.env` and `secrets/` with it, because restoring needs both. To
+Keep a copy of `.env` and `secrets/` with it, because restoring needs both, and
+`APP_ENCRYPTION_KEY` in `.env` is what reads the passwords in the dump. To
 restore into an empty stack:
 
 ```bash
@@ -381,31 +509,39 @@ docker compose up -d
 
 ## Troubleshooting
 
-**No reports arrive.** First check the authorization record, the most common
-cause when only some domains report in:
+**No reports arrive from a mailbox.** Open the mailbox on the Platform page and
+press Test, then look at its log. A sign-in that fails names the reason, and the
+log names every message that was skipped and why. If reports arrive for some
+domains only, check [the `_report._dmarc` record](#the-_report_dmarc-record) on
+the report address's domain:
 
 ```bash
-dig +short TXT '*._report._dmarc.dmarc.example.com'
+dig +short TXT '*._report._dmarc.example.com'
 ```
 
-It should print `"v=DMARC1"`. Then check that port `25` reaches the server, from
-another machine: `nc -vz dmarc.example.com 25`. Providers often block it by
+It should print `"v=DMARC1"`.
+
+**No reports arrive at the mail gateway.** Check the authorization record as
+above, on `MAIL_GATEWAY_DOMAIN`. Then check that port `25` reaches the server,
+from another machine: `nc -vz dmarc.example.com 25`. Providers often block it by
 default. Finally look at `docker compose logs postfix processor`.
 
-**Reports stopped after a configuration change.** When the backend refuses
-report email for a reason that waiting cannot fix, such as a `WEBHOOK_SECRET`
-in `.env` that no longer matches `secrets/webhook_secret.txt`, the processor
-keeps each refused report instead of dropping it. So does a report that still
-fails after about five days of retries. `docker compose logs processor` names
-the cause. Fix it, then send the kept reports through again:
+**The gateway's reports stopped after a configuration change.** When the
+backend refuses report email for a reason that waiting cannot fix, such as a
+webhook secret that differs between the Platform page and
+`secrets/webhook_secret.txt`, the processor keeps each refused report instead
+of dropping it. So does a report that still fails after about five days of
+retries, which is what happens while API intake is switched off. `docker
+compose logs processor` names the cause. Fix it, then send the kept reports
+through again:
 
 ```bash
 docker compose exec processor npm run replay-dead-letter
 ```
 
-**No notification emails arrive.** DMARCo sends mail only when `MAILER_DSN` is
-set. Look for errors with `docker compose logs worker`, fix `.env`, and run
-`docker compose up -d`.
+**No notification emails arrive.** DMARCo sends mail only when outgoing email
+is set up on the Platform page. Send a test email from there, which shows the
+mail server's answer, and look for errors with `docker compose logs worker`.
 
 **The site does not load over HTTPS.** Caddy needs ports `80` and `443` free,
 and `APP_DOMAIN` has to resolve to this server before it can get a certificate.
@@ -451,8 +587,8 @@ The installer and the Compose stack. The application itself is developed in
 three repositories, and this stack runs their published images:
 
 - [`dmarcoapp/dashboard`](https://github.com/dmarcoapp/dashboard): the web UI
-- [`dmarcoapp/backend`](https://github.com/dmarcoapp/backend): API, workers, and report processing
-- [`dmarcoapp/mail-inbound`](https://github.com/dmarcoapp/mail-inbound): the inbound mail gateway
+- [`dmarcoapp/backend`](https://github.com/dmarcoapp/backend): API, workers, mailbox reading, and report processing
+- [`dmarcoapp/mail-inbound`](https://github.com/dmarcoapp/mail-inbound): the mail gateway, being retired
 
 ## License
 

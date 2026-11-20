@@ -5,10 +5,13 @@
 #   bash -c "$(curl -fsSL https://raw.githubusercontent.com/dmarcoapp/dmarcoapp/main/install.sh)"
 #
 # Downloads the Compose stack, asks for the handful of settings DMARCo needs,
-# generates secrets and starts everything. Answers can also be supplied as
-# environment variables, in which case the installer does not ask for them:
+# generates secrets and starts everything. Run again over an existing install,
+# it upgrades it. Answers can also be supplied as environment variables, in
+# which case the installer does not ask for them:
 #
-#   APP_DOMAIN=dmarc.example.com ACME_EMAIL=you@example.com ./install.sh
+#   APP_DOMAIN=dmarc.example.com ACME_EMAIL=you@example.com \
+#   DMARCO_INTAKE=imap IMAP_HOST=imap.example.com IMAP_USERNAME=dmarc@example.com \
+#   IMAP_PASSWORD=... ./install.sh
 #
 set -euo pipefail
 
@@ -16,6 +19,10 @@ REPO="${DMARCO_REPO:-dmarcoapp/dmarcoapp}"
 REF="${DMARCO_REF:-main}"
 RAW_BASE="https://raw.githubusercontent.com/${REPO}/${REF}"
 STACK_FILES=(compose.yaml Caddyfile .env.example clamav/clamd.conf clamav/freshclam.conf)
+
+# The settings 0.4 kept in .env, which live in the database from 0.5 on.
+LEGACY_SETTINGS=(REPORT_DOMAIN WEBHOOK_SECRET MAILER_DSN APP_EMAIL_SENDER_ADDRESS
+    APP_REPORT_RETENTION_DAYS APP_IP_LOOKUP_ENABLED)
 
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
     C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'
@@ -28,6 +35,7 @@ info() { printf '%s==>%s %s\n' "$C_BLUE" "$C_RESET" "$*"; }
 ok() { printf '%s  ok%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
 warn() { printf '%swarn%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
 die() { printf '%serror%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; exit 1; }
+note() { printf '%s%s%s\n' "$C_DIM" "$*" "$C_RESET"; }
 
 # True when the script can actually read from the terminal, which is what lets
 # the installer prompt even when it is piped into bash.
@@ -43,8 +51,13 @@ else
 fi
 
 ask() {
-    local var="$1" text="$2" default="${3:-}" answer
+    local var="$1" text="$2" default="${3:-}" answer at_end
     if [ -n "${!var:-}" ]; then
+        return 0
+    fi
+    # Unattended, a question with a default takes it.
+    if [ -n "${DMARCO_YES:-}" ] && [ -n "$default" ]; then
+        printf -v "$var" '%s' "$default"
         return 0
     fi
     while true; do
@@ -53,14 +66,17 @@ ask() {
         else
             printf '%s%s%s: ' "$C_BOLD" "$text" "$C_RESET" >&2
         fi
+        at_end=''
         if ! IFS= read -r answer < "$INPUT"; then
-            answer=''
+            at_end=1
         fi
         answer="${answer:-$default}"
         if [ -n "$answer" ]; then
             printf -v "$var" '%s' "$answer"
             return 0
         fi
+        # Nothing more is coming, so asking again would loop for good.
+        [ -z "$at_end" ] || die "No answer for \"${text}\". Pass it as ${var} in the environment."
         warn "A value is required."
     done
 }
@@ -70,10 +86,20 @@ ask_secret() {
     if [ -n "${!var:-}" ]; then
         return 0
     fi
-    printf '%s%s%s: ' "$C_BOLD" "$text" "$C_RESET" >&2
-    IFS= read -rs answer < "$INPUT" || answer=''
-    printf '\n' >&2
-    printf -v "$var" '%s' "$answer"
+    while true; do
+        printf '%s%s%s: ' "$C_BOLD" "$text" "$C_RESET" >&2
+        if ! IFS= read -rs answer < "$INPUT"; then
+            printf '\n' >&2
+            [ -n "${answer:-}" ] || die "No answer for \"${text}\". Pass it as ${var} in the environment."
+        else
+            printf '\n' >&2
+        fi
+        if [ -n "$answer" ]; then
+            printf -v "$var" '%s' "$answer"
+            return 0
+        fi
+        warn "A value is required."
+    done
 }
 
 confirm() {
@@ -89,28 +115,23 @@ confirm() {
     esac
 }
 
-generate_secret() {
+random_hex() {
+    local bytes="$1"
     if command -v openssl > /dev/null 2>&1; then
-        openssl rand -hex 24
+        openssl rand -hex "$bytes"
     else
-        LC_ALL=C tr -dc 'a-f0-9' < /dev/urandom | head -c 48
+        LC_ALL=C tr -dc 'a-f0-9' < /dev/urandom | head -c "$((bytes * 2))"
         printf '\n'
     fi
 }
 
-# Percent-encodes a string for use inside a URL, so passwords containing
-# characters such as @ or / do not break the mailer DSN.
-urlencode() {
-    # LC_ALL=C makes the loop walk bytes, which is what percent-encoding needs.
-    local LC_ALL=C string="$1" index char out=''
-    for ((index = 0; index < ${#string}; index++)); do
-        char="${string:index:1}"
-        case "$char" in
-            [a-zA-Z0-9.~_-]) out+="$char" ;;
-            *) out+="$(printf '%%%02X' "'$char")" ;;
-        esac
-    done
-    printf '%s' "$out"
+generate_secret() {
+    random_hex 24
+}
+
+# The backend wants 32 bytes, as 64 hexadecimal characters.
+generate_encryption_key() {
+    random_hex 32
 }
 
 # Escapes a hostname for use inside the CORS origin regular expression.
@@ -120,7 +141,7 @@ regex_escape() {
 }
 
 # Looks up existing MX records, so the installer can warn before a domain that
-# already receives email is pointed at DMARCo.
+# already receives email is pointed at the mail gateway.
 existing_mx() {
     local domain="$1"
     # No records is the normal case, so never fail the caller.
@@ -201,7 +222,7 @@ check_requirements() {
     ok "Docker $(docker version --format '{{.Server.Version}}' 2> /dev/null || printf 'ok')"
 
     local port
-    for port in 25 80 443; do
+    for port in 80 443; do
         if port_in_use "$port"; then
             warn "Port ${port} is already in use. DMARCo needs it and will fail to start until it is free."
         fi
@@ -233,75 +254,39 @@ fetch_stack() {
     done
 }
 
-collect_configuration() {
-    info "Configuration"
-    printf '%sDMARCo needs a domain that points to this server.%s\n\n' "$C_DIM" "$C_RESET"
+# ------------------------------------------------------------- reading .env
 
-    ask APP_DOMAIN "Domain for the dashboard and API" ""
-    ask ACME_EMAIL "Email address for Let's Encrypt" ""
-    ask REPORT_DOMAIN "Domain your DMARC reports are sent to, which must not receive other email" "$APP_DOMAIN"
-    check_report_domain
-    ask SMTP_HOSTNAME "Public hostname of this mail server" "$APP_DOMAIN"
-
-    # Mail only carries notifications, so an unattended install goes without it
-    # unless MAILER_DSN is passed in, and it can be added to .env any time.
-    if [ -z "${MAILER_DSN:-}" ]; then
-        printf '\n%sDMARCo can email you a weekly overview and sign-in alerts. That needs an\nSMTP account, and everything else works without one.%s\n' "$C_DIM" "$C_RESET"
-        if [ -z "${DMARCO_YES:-}" ] && confirm "Set up outgoing email now?"; then
-            ask MAIL_HOST "SMTP server for outgoing email" ""
-            ask MAIL_PORT "SMTP port" "587"
-            ask MAIL_USER "SMTP username" ""
-            ask_secret MAIL_PASSWORD "SMTP password"
-            MAILER_DSN="smtp://$(urlencode "$MAIL_USER"):$(urlencode "$MAIL_PASSWORD")@${MAIL_HOST}:${MAIL_PORT}"
-        else
-            MAILER_DSN='null://null'
-        fi
-    fi
-    if [ "$MAILER_DSN" != 'null://null' ]; then
-        ask APP_EMAIL_SENDER_ADDRESS "Sender address for DMARCo emails" "no-reply@${APP_DOMAIN}"
-    fi
-
-    APP_SCHEME="${APP_SCHEME:-https}"
-    CORS_ALLOW_ORIGIN="${CORS_ALLOW_ORIGIN:-^${APP_SCHEME}://$(regex_escape "$APP_DOMAIN")$}"
-
-    APP_SECRET="${APP_SECRET:-$(generate_secret)}"
-    WEBHOOK_SECRET="${WEBHOOK_SECRET:-$(generate_secret)}"
-    POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-$(generate_secret)}"
-    RABBITMQ_PASSWORD="${RABBITMQ_PASSWORD:-$(generate_secret)}"
+# Prints the value of one setting in .env. The file is read rather than
+# sourced: the shell would eat the backslashes and dollar signs that Compose
+# passes through untouched, among them the ones in the CORS_ALLOW_ORIGIN
+# regular expression.
+env_file_value() {
+    local file="${INSTALL_DIR}/.env" key="$1" value
+    [ -f "$file" ] || return 0
+    value="$(sed -n "s/^[[:space:]]*${key}=//p" "$file" | head -n 1)"
+    value="${value%$'\r'}"
+    # Compose strips one pair of surrounding quotes, and so does this.
+    case "$value" in
+        \"*\") value="${value#\"}"; value="${value%\"}" ;;
+        \'*\') value="${value#\'}"; value="${value%\'}" ;;
+    esac
+    printf '%s' "$value"
 }
 
-check_report_domain() {
-    local mx=''
-    mx="$(existing_mx "$REPORT_DOMAIN")" || true
-    [ -n "$mx" ] || return 0
-
-    warn "${REPORT_DOMAIN} already has MX records:"
-    printf '%s\n' "$mx" | sed 's/^/       /' >&2
-    warn "DMARCo replaces them and accepts only DMARC reports, so any other email sent to ${REPORT_DOMAIN} would be lost."
-    warn "Use a dedicated domain or subdomain instead, such as dmarc.${REPORT_DOMAIN}."
-
-    confirm "Use ${REPORT_DOMAIN} anyway?" ||
-        die "Run the installer again with a domain that does not receive other email."
+env_file_has() {
+    grep -qE "^[[:space:]]*${1}=" "${INSTALL_DIR}/.env" 2> /dev/null
 }
 
 # Reads settings out of an existing .env, skipping the ones the caller already
-# has, because a value in the environment is the one Compose uses as well. The
-# file is read rather than sourced: the shell would eat the backslashes and
-# dollar signs that Compose passes through untouched, among them the ones in
-# the CORS_ALLOW_ORIGIN regular expression. Succeeds when it read anything.
+# has, because a value in the environment is the one Compose uses as well.
+# Succeeds when it read anything.
 load_env_values() {
-    local file="${INSTALL_DIR}/.env" key value loaded=1
-    [ -f "$file" ] || return 1
+    local key value loaded=1
+    [ -f "${INSTALL_DIR}/.env" ] || return 1
 
     for key in "$@"; do
         [ -z "${!key:-}" ] || continue
-        value="$(sed -n "s/^[[:space:]]*${key}=//p" "$file" | head -n 1)"
-        value="${value%$'\r'}"
-        # Compose strips one pair of surrounding quotes, and so does this.
-        case "$value" in
-            \"*\") value="${value#\"}"; value="${value%\"}" ;;
-            \'*\') value="${value#\'}"; value="${value%\'}" ;;
-        esac
+        value="$(env_file_value "$key")"
         [ -n "$value" ] || continue
         printf -v "$key" '%s' "$value"
         loaded=0
@@ -310,24 +295,246 @@ load_env_values() {
     return "$loaded"
 }
 
+# ------------------------------------------------------------- changing .env
+
+# Keeps the .env as it was before this run changed it, once per run, because
+# it holds the only copy of secrets the data depends on.
+backup_env() {
+    [ -z "${ENV_BACKUP:-}" ] || return 0
+    ENV_BACKUP="${INSTALL_DIR}/.env.backup-$(date -u '+%Y%m%d%H%M%S')"
+    cp "${INSTALL_DIR}/.env" "$ENV_BACKUP"
+    chmod 600 "$ENV_BACKUP"
+}
+
+# Writes the result of an awk program over .env back to .env, keeping its mode.
+rewrite_env() {
+    local file="${INSTALL_DIR}/.env" tmp
+    tmp="$(mktemp "${file}.XXXXXX")"
+    awk "$@" "$file" > "$tmp"
+    chmod 600 "$tmp"
+    mv "$tmp" "$file"
+}
+
+# Sets one setting, in place of the line that holds it or at the end. The
+# values go through the environment, where awk leaves backslashes alone.
+env_set() {
+    # shellcheck disable=SC2016  # an awk program, read by awk and not the shell
+    ENV_KEY="$1" ENV_LINE="$1=$2" rewrite_env '
+        BEGIN { key = ENVIRON["ENV_KEY"]; done = 0 }
+        {
+            line = $0
+            sub(/^[[:space:]]*/, "", line)
+            if (index(line, key "=") == 1) {
+                if (!done) print ENVIRON["ENV_LINE"]
+                done = 1
+                next
+            }
+            print
+        }
+        END { if (!done) print ENVIRON["ENV_LINE"] }'
+}
+
+env_remove() {
+    # shellcheck disable=SC2016  # an awk program, read by awk and not the shell
+    ENV_KEYS="$*" rewrite_env '
+        BEGIN { n = split(ENVIRON["ENV_KEYS"], keys, " "); for (i = 1; i <= n; i++) drop[keys[i]] = 1 }
+        {
+            line = $0
+            sub(/^[[:space:]]*/, "", line)
+            eq = index(line, "=")
+            if (eq > 1 && (substr(line, 1, eq - 1) in drop)) next
+            # One empty line where the removed lines leave two.
+            if ($0 ~ /^[[:space:]]*$/ && blank) next
+            blank = ($0 ~ /^[[:space:]]*$/)
+            print
+        }'
+}
+
+has_profile() {
+    case ",${COMPOSE_PROFILES:-}," in
+        *",$1,"*) return 0 ;;
+    esac
+    return 1
+}
+
+add_profile() {
+    has_profile "$1" || COMPOSE_PROFILES="${COMPOSE_PROFILES:+${COMPOSE_PROFILES},}$1"
+}
+
+# ------------------------------------------------------------ configuration
+
+# Which ways in the reports take. Any combination works, side by side.
+choose_intake() {
+    local choice token valid
+    INTAKE_IMAP=''; INTAKE_API=''; INTAKE_GATEWAY=''
+
+    if [ -z "${DMARCO_INTAKE:-}" ]; then
+        printf '\n%sHow should DMARC reports reach DMARCo?%s\n\n' "$C_BOLD" "$C_RESET"
+        printf '  1  From a mailbox you already have, read over IMAP\n'
+        printf '  2  Uploaded through the API, with a key\n'
+        printf '  3  Received by email on this server, by the mail gateway on port 25.\n'
+        printf '     The older way, being retired.\n\n'
+    fi
+
+    while true; do
+        choice="${DMARCO_INTAKE:-}"
+        ask choice "Pick one or more, such as 1 or 1,2" "1"
+        valid=1
+        for token in ${choice//,/ }; do
+            case "$token" in
+                1 | imap) INTAKE_IMAP=1 ;;
+                2 | api) INTAKE_API=1 ;;
+                3 | gateway) INTAKE_GATEWAY=1 ;;
+                *) valid='' ;;
+            esac
+        done
+        if [ -n "$valid" ] && [ -n "${INTAKE_IMAP}${INTAKE_API}${INTAKE_GATEWAY}" ]; then
+            return 0
+        fi
+        [ -z "${DMARCO_INTAKE:-}" ] || die "DMARCO_INTAKE takes imap, api, and gateway, separated by commas."
+        warn "Answer with 1, 2, 3, or several of them separated by commas."
+        INTAKE_IMAP=''; INTAKE_API=''; INTAKE_GATEWAY=''
+    done
+}
+
+collect_mailbox() {
+    printf '\n%sThe mailbox your DMARC records send reports to. DMARCo signs in over TLS,\nchecks the certificate, and touches only messages with a report attached.%s\n\n' "$C_DIM" "$C_RESET"
+
+    ask IMAP_HOST "IMAP server" ""
+    while true; do
+        ask IMAP_SECURITY "Encryption, tls or starttls" "tls"
+        case "$IMAP_SECURITY" in
+            tls | starttls) break ;;
+        esac
+        warn "Answer tls or starttls. DMARCo does not sign in without encryption."
+        IMAP_SECURITY=''
+    done
+    if [ "$IMAP_SECURITY" = tls ]; then
+        ask IMAP_PORT "Port" "993"
+    else
+        ask IMAP_PORT "Port" "143"
+    fi
+    ask IMAP_USERNAME "Username" ""
+    ask_secret IMAP_PASSWORD "Password, or an app password if the provider has them"
+    ask IMAP_FOLDER "Folder the reports arrive in" "INBOX"
+    case "$IMAP_USERNAME" in
+        *@*.*) ask IMAP_REPORT_ADDRESS "Address your DMARC records send reports to" "$IMAP_USERNAME" ;;
+        *) ask IMAP_REPORT_ADDRESS "Address your DMARC records send reports to" "" ;;
+    esac
+    IMAP_NAME="${IMAP_NAME:-DMARC reports}"
+}
+
+collect_gateway() {
+    printf '\n%sThe mail gateway runs Postfix on port 25, for a domain whose MX record points\nhere, and scans each report with ClamAV, which needs about 1.5 GB of memory.%s\n\n' "$C_DIM" "$C_RESET"
+
+    local previous
+    previous="$(env_file_value MAIL_GATEWAY_DOMAIN)"
+    ask MAIL_GATEWAY_DOMAIN "Domain your DMARC reports are sent to, which must not receive other email" "${previous:-${REPORT_DOMAIN:-$APP_DOMAIN}}"
+    check_gateway_domain
+    ask SMTP_HOSTNAME "Public hostname of the mail gateway" "$APP_DOMAIN"
+    if port_in_use 25; then
+        warn "Port 25 is already in use. The mail gateway needs it and will fail to start until it is free."
+    fi
+    WEBHOOK_SECRET="${WEBHOOK_SECRET:-$(generate_secret)}"
+}
+
+check_gateway_domain() {
+    local mx=''
+    mx="$(existing_mx "$MAIL_GATEWAY_DOMAIN")" || true
+    [ -n "$mx" ] || return 0
+
+    warn "${MAIL_GATEWAY_DOMAIN} already has MX records:"
+    printf '%s\n' "$mx" | sed 's/^/       /' >&2
+    warn "The gateway replaces them and accepts only DMARC reports, so any other email sent to ${MAIL_GATEWAY_DOMAIN} would be lost."
+    warn "Use a dedicated domain or subdomain instead, such as dmarc.${MAIL_GATEWAY_DOMAIN}."
+
+    confirm "Use ${MAIL_GATEWAY_DOMAIN} anyway?" ||
+        die "Run the installer again with a domain that does not receive other email."
+}
+
+collect_configuration() {
+    info "Configuration"
+    printf '%sDMARCo needs a domain that points to this server.%s\n\n' "$C_DIM" "$C_RESET"
+
+    ask APP_DOMAIN "Domain for the dashboard and API" ""
+    ask ACME_EMAIL "Email address for Let's Encrypt" ""
+
+    choose_intake
+    [ -z "$INTAKE_IMAP" ] || collect_mailbox
+    [ -z "$INTAKE_GATEWAY" ] || collect_gateway
+
+    printf '\n%sOutgoing email for notifications, report retention, and IP lookups are set\non the Platform page of the dashboard once it runs.%s\n' "$C_DIM" "$C_RESET"
+
+    APP_SCHEME="${APP_SCHEME:-https}"
+    CORS_ALLOW_ORIGIN="${CORS_ALLOW_ORIGIN:-^${APP_SCHEME}://$(regex_escape "$APP_DOMAIN")$}"
+
+    APP_SECRET="${APP_SECRET:-$(generate_secret)}"
+    POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-$(generate_secret)}"
+    RABBITMQ_PASSWORD="${RABBITMQ_PASSWORD:-$(generate_secret)}"
+    APP_ENCRYPTION_KEY="${APP_ENCRYPTION_KEY:-$(generate_encryption_key)}"
+}
+
 # Postgres and RabbitMQ store the password they are given the first time they
 # initialize their volume and ignore the environment from then on, so freshly
 # generated secrets would lock the stack out of data an earlier install left
 # behind. An overwrite therefore starts from the secrets already on disk, the
-# rest of them included, so nothing signed with the old ones breaks either.
+# rest of them included, so nothing signed or encrypted with the old ones
+# breaks either. The settings 0.4 kept in .env are read as well, so they reach
+# the database instead of being lost with the old file.
 keep_existing_secrets() {
-    if load_env_values APP_SECRET WEBHOOK_SECRET POSTGRES_PASSWORD \
+    local stored=''
+    if load_env_values APP_SECRET APP_ENCRYPTION_KEY WEBHOOK_SECRET POSTGRES_PASSWORD \
         RABBITMQ_PASSWORD; then
         info "Keeping the secrets from the existing .env, which its data depends on"
     fi
+    if [ -z "${WEBHOOK_SECRET:-}" ] && [ -f "${INSTALL_DIR}/secrets/webhook_secret.txt" ]; then
+        stored="$(head -n 1 "${INSTALL_DIR}/secrets/webhook_secret.txt")"
+        [ "$stored" = unused ] || WEBHOOK_SECRET="$stored"
+    fi
+    load_env_values REPORT_DOMAIN MAILER_DSN APP_EMAIL_SENDER_ADDRESS \
+        APP_REPORT_RETENTION_DAYS APP_IP_LOOKUP_ENABLED || true
 }
 
 # What the installer itself needs when it keeps an existing .env: the summary
 # prints the domains, and the passwords have to match what the data stores
 # have. The rest of the file is Compose's business, and Compose reads it.
 load_existing_configuration() {
-    load_env_values APP_DOMAIN APP_SCHEME REPORT_DOMAIN SMTP_HOSTNAME \
-        POSTGRES_USER POSTGRES_PASSWORD RABBITMQ_USER RABBITMQ_PASSWORD || true
+    load_env_values APP_DOMAIN APP_SCHEME REPORT_DOMAIN MAIL_GATEWAY_DOMAIN SMTP_HOSTNAME \
+        COMPOSE_PROFILES APP_ENCRYPTION_KEY POSTGRES_USER POSTGRES_PASSWORD POSTGRES_DB \
+        RABBITMQ_USER RABBITMQ_PASSWORD || true
+}
+
+# An .env from before 0.5 has no APP_ENCRYPTION_KEY. Until it has one, the
+# backend keeps reading its settings from .env and has no mailboxes or API keys.
+ensure_encryption_key() {
+    [ -z "${APP_ENCRYPTION_KEY:-}" ] || return 0
+
+    info "Upgrading the configuration"
+    note "DMARCo now keeps outgoing email, report retention, IP lookups, and how reports
+come in on the dashboard's Platform page, and encrypts the passwords among them
+with a key of its own. The installer adds that key to .env, the database takes the
+settings over when DMARCo starts, and the lines they came from are removed."
+    backup_env
+    APP_ENCRYPTION_KEY="$(generate_encryption_key)"
+    env_set APP_ENCRYPTION_KEY "$APP_ENCRYPTION_KEY"
+    ok "APP_ENCRYPTION_KEY, saved in .env. Keep a copy with your backups."
+}
+
+# Every install before 0.5 received its reports through the mail gateway,
+# which runs only with the mail-gateway profile now.
+keep_gateway_running() {
+    has_profile mail-gateway && return 0
+    env_file_has REPORT_DOMAIN || return 0
+
+    info "Keeping the mail gateway running"
+    note "This install receives its reports through the mail gateway, which now runs only
+with mail-gateway in COMPOSE_PROFILES. It stays on. Mailboxes read over IMAP
+replace it: add one on the Platform page, and the README says how to switch the
+gateway off afterwards."
+    backup_env
+    add_profile mail-gateway
+    env_set COMPOSE_PROFILES "$COMPOSE_PROFILES"
+    ok "COMPOSE_PROFILES=${COMPOSE_PROFILES}"
 }
 
 # Docker volumes outlive the install directory, so an install that starts
@@ -348,42 +555,48 @@ report_existing_data() {
 write_configuration() {
     info "Writing configuration"
 
+    if [ -n "${INTAKE_GATEWAY:-}" ]; then
+        add_profile mail-gateway
+    fi
+
     umask 077
-    cat > "${INSTALL_DIR}/.env" <<- EOF
-		# Generated by install.sh on $(date -u '+%Y-%m-%d %H:%M:%S UTC').
-		# See .env.example for what every setting does.
-
-		APP_DOMAIN=${APP_DOMAIN}
-		ACME_EMAIL=${ACME_EMAIL}
-		CORS_ALLOW_ORIGIN=${CORS_ALLOW_ORIGIN}
-		APP_SCHEME=${APP_SCHEME}
-
-		REPORT_DOMAIN=${REPORT_DOMAIN}
-		SMTP_HOSTNAME=${SMTP_HOSTNAME}
-		SMTP_TLS_MODE=${SMTP_TLS_MODE:-self-signed}
-
-		MAILER_DSN=${MAILER_DSN}
-		APP_EMAIL_SENDER_ADDRESS=${APP_EMAIL_SENDER_ADDRESS:-no-reply@${APP_DOMAIN}}
-
-		APP_SECRET=${APP_SECRET}
-		WEBHOOK_SECRET=${WEBHOOK_SECRET}
-		POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
-		RABBITMQ_PASSWORD=${RABBITMQ_PASSWORD}
-
-		APP_REPORT_RETENTION_DAYS=${APP_REPORT_RETENTION_DAYS:-365}
-		APP_IP_LOOKUP_ENABLED=${APP_IP_LOOKUP_ENABLED:-true}
-		CLAMAV_SCAN_ENABLED=${CLAMAV_SCAN_ENABLED:-true}
-
-		BACKEND_VERSION=${BACKEND_VERSION:-latest}
-		DASHBOARD_VERSION=${DASHBOARD_VERSION:-latest}
-		MAIL_INBOUND_VERSION=${MAIL_INBOUND_VERSION:-latest}
-	EOF
+    {
+        printf '# Generated by install.sh on %s.\n' "$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+        printf '# See .env.example for what every setting does. How reports come in, outgoing\n'
+        printf '# email, retention, and IP lookups are set on the Platform page.\n\n'
+        printf 'APP_DOMAIN=%s\n' "$APP_DOMAIN"
+        printf 'ACME_EMAIL=%s\n' "$ACME_EMAIL"
+        printf 'CORS_ALLOW_ORIGIN=%s\n' "$CORS_ALLOW_ORIGIN"
+        printf 'APP_SCHEME=%s\n\n' "$APP_SCHEME"
+        printf 'APP_SECRET=%s\n' "$APP_SECRET"
+        printf 'APP_ENCRYPTION_KEY=%s\n' "$APP_ENCRYPTION_KEY"
+        printf 'POSTGRES_PASSWORD=%s\n' "$POSTGRES_PASSWORD"
+        printf 'RABBITMQ_PASSWORD=%s\n\n' "$RABBITMQ_PASSWORD"
+        if [ -n "${COMPOSE_PROFILES:-}" ]; then
+            printf 'COMPOSE_PROFILES=%s\n' "$COMPOSE_PROFILES"
+        fi
+        if [ -n "${INTAKE_GATEWAY:-}" ]; then
+            printf 'MAIL_GATEWAY_DOMAIN=%s\n' "$MAIL_GATEWAY_DOMAIN"
+            printf 'SMTP_HOSTNAME=%s\n' "$SMTP_HOSTNAME"
+            printf 'SMTP_TLS_MODE=%s\n' "${SMTP_TLS_MODE:-self-signed}"
+            printf 'CLAMAV_SCAN_ENABLED=%s\n' "${CLAMAV_SCAN_ENABLED:-true}"
+        fi
+        [ -z "${COMPOSE_PROFILES:-}${INTAKE_GATEWAY:-}" ] || printf '\n'
+        printf 'BACKEND_VERSION=%s\n' "${BACKEND_VERSION:-latest}"
+        printf 'DASHBOARD_VERSION=%s\n' "${DASHBOARD_VERSION:-latest}"
+        printf 'MAIL_INBOUND_VERSION=%s\n' "${MAIL_INBOUND_VERSION:-latest}"
+    } > "${INSTALL_DIR}/.env"
     chmod 600 "${INSTALL_DIR}/.env"
     ok ".env"
 
     mkdir -p "${INSTALL_DIR}/secrets"
     chmod 700 "${INSTALL_DIR}/secrets"
-    printf '%s\n' "$WEBHOOK_SECRET" > "${INSTALL_DIR}/secrets/webhook_secret.txt"
+    if [ -n "${INTAKE_GATEWAY:-}" ]; then
+        printf '%s\n' "$WEBHOOK_SECRET" > "${INSTALL_DIR}/secrets/webhook_secret.txt"
+    elif [ ! -f "${INSTALL_DIR}/secrets/webhook_secret.txt" ]; then
+        # Read by the mail gateway alone, which is off.
+        printf 'unused\n' > "${INSTALL_DIR}/secrets/webhook_secret.txt"
+    fi
     # The credentials of the MinIO store releases before 0.4 ran, which nothing
     # reads any more.
     rm -f "${INSTALL_DIR}/secrets/s3_access_key.txt" "${INSTALL_DIR}/secrets/s3_secret_key.txt"
@@ -453,6 +666,12 @@ start_stack() {
         warn "The database or the message broker did not come up. Check: docker compose logs database rabbitmq"
     fi
 
+    # Compose leaves the containers of a profile that is no longer active
+    # running, so a mail gateway switched off has to be removed by name.
+    if ! has_profile mail-gateway; then
+        compose --profile mail-gateway rm --stop --force postfix processor clamav > /dev/null 2>&1 || true
+    fi
+
     # An install over an earlier one also clears out the services the recipe no
     # longer has, such as the object storage releases before 0.4 ran.
     info "Starting DMARCo"
@@ -470,9 +689,187 @@ start_stack() {
     fi
 }
 
+# --------------------------------------------------- settings in the database
+
+# The answer of app:platform:import-env --format=json is one line of JSON with
+# lists of variable names. These read it without needing jq.
+json_list() {
+    printf '%s' "$2" | sed -n "s/.*\"$1\":\[\([^]]*\)\].*/\1/p" | tr ',' '\n' | tr -d '" ' | grep -v '^$' || true
+}
+
+json_string() {
+    printf '%s' "$2" | sed -n "s/.*\"$1\":\"\([^\"]*\)\".*/\1/p"
+}
+
+# The backend names two of them differently from .env.
+env_name_of() {
+    case "$1" in
+        APP_DMARC_AGGREGATE_REPORT_EMAIL_RECEIVER_DOMAIN) printf 'REPORT_DOMAIN' ;;
+        APP_INBOUND_REPORT_EMAIL_WEBHOOK_SECRET) printf 'WEBHOOK_SECRET' ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
+# Runs the backend's import of the old settings, with the given variables set
+# in the environment of that one command, and prints its JSON answer. The
+# values travel through the environment rather than the command line, where
+# other users of the host could read them.
+run_import() {
+    local args=() name
+    for name in "$@"; do
+        args+=(-e "$name")
+    done
+    compose exec -T ${args[@]+"${args[@]}"} php bin/console app:platform:import-env --format=json 2> /dev/null |
+        grep '^{' | tail -n 1 || true
+}
+
+# Kept means the database had a value already, which is news only when the
+# backend has not just taken the same one over on its start.
+report_import() {
+    local result="$1" with_kept="${2:-}" name
+    if [ -n "$with_kept" ]; then
+        for name in $(json_list kept "$result"); do
+            note "     $(env_name_of "$name") was already set on the Platform page, which keeps its value."
+        done
+    fi
+    for name in $(json_list invalid "$result"); do
+        warn "$(env_name_of "$name") holds something DMARCo cannot take over. Set it on the Platform page instead."
+    done
+}
+
+# Takes what an .env from 0.4 still holds into the database, which the backend
+# already did when it started, and removes the lines that are taken care of.
+settle_environment() {
+    local result name key value removed=()
+    local file="${INSTALL_DIR}/.env"
+
+    for key in "${LEGACY_SETTINGS[@]}"; do
+        if env_file_has "$key"; then
+            removed+=("$key")
+        fi
+    done
+    [ "${#removed[@]}" -gt 0 ] || return 0
+    removed=()
+
+    info "Moving settings from .env into the database"
+    result="$(run_import)"
+    if [ "$(json_string mode "$result")" != platform ]; then
+        warn "The backend did not take the settings over, so .env keeps them. Run the installer again once the backend runs."
+        return 0
+    fi
+    report_import "$result"
+
+    for name in $(json_list settled "$result"); do
+        key="$(env_name_of "$name")"
+        env_file_has "$key" && removed+=("$key")
+    done
+    [ "${#removed[@]}" -gt 0 ] || return 0
+
+    backup_env
+    for key in "${removed[@]}"; do
+        case "$key" in
+            REPORT_DOMAIN)
+                # The gateway still needs the domain, under a name the backend
+                # does not read.
+                value="$(env_file_value REPORT_DOMAIN)"
+                if has_profile mail-gateway && ! env_file_has MAIL_GATEWAY_DOMAIN && [ -n "$value" ]; then
+                    env_set MAIL_GATEWAY_DOMAIN "$value"
+                    MAIL_GATEWAY_DOMAIN="$value"
+                fi
+                ;;
+            WEBHOOK_SECRET)
+                # The backend now has the secret from .env, and the gateway
+                # reads it from this file, so the two have to agree.
+                value="$(env_file_value WEBHOOK_SECRET)"
+                if [ -n "$value" ] && [ "$(head -n 1 "${INSTALL_DIR}/secrets/webhook_secret.txt" 2> /dev/null)" != "$value" ]; then
+                    printf '%s\n' "$value" > "${INSTALL_DIR}/secrets/webhook_secret.txt"
+                    RESTART_PROCESSOR=1
+                fi
+                ;;
+        esac
+    done
+    env_remove "${removed[@]}"
+    ok "Moved into the database and removed from .env: ${removed[*]}"
+
+    # The containers still carry the old values until they are recreated.
+    compose up -d > /dev/null 2>&1 || warn "Could not restart the stack. Run: cd ${INSTALL_DIR} && docker compose up -d"
+    if [ -n "${RESTART_PROCESSOR:-}" ] && has_profile mail-gateway; then
+        compose restart processor > /dev/null 2>&1 || true
+    fi
+}
+
+# The settings a new install was given, which go into the database the same
+# way an upgrade's do, without passing through .env.
+import_new_settings() {
+    local names=() result
+    (
+        if [ -n "${INTAKE_GATEWAY:-}" ]; then
+            export APP_DMARC_AGGREGATE_REPORT_EMAIL_RECEIVER_DOMAIN="$MAIL_GATEWAY_DOMAIN"
+            export APP_INBOUND_REPORT_EMAIL_WEBHOOK_SECRET="$WEBHOOK_SECRET"
+            names+=(APP_DMARC_AGGREGATE_REPORT_EMAIL_RECEIVER_DOMAIN APP_INBOUND_REPORT_EMAIL_WEBHOOK_SECRET)
+        fi
+        for name in MAILER_DSN APP_EMAIL_SENDER_ADDRESS APP_REPORT_RETENTION_DAYS APP_IP_LOOKUP_ENABLED; do
+            if [ -n "${!name:-}" ]; then
+                export "${name?}"
+                names+=("$name")
+            fi
+        done
+        [ "${#names[@]}" -gt 0 ] || exit 0
+
+        info "Saving the settings in the database"
+        result="$(run_import "${names[@]}")"
+        if [ "$(json_string mode "$result")" != platform ]; then
+            warn "The backend did not take the settings. Set them on the Platform page."
+            exit 0
+        fi
+        report_import "$result" with-kept
+        ok "Settings saved"
+    )
+}
+
+add_mailbox() {
+    local args=(--name="$IMAP_NAME" --host="$IMAP_HOST" --port="$IMAP_PORT"
+        --security="$IMAP_SECURITY" --username="$IMAP_USERNAME" --folder="$IMAP_FOLDER" --test)
+    [ -z "${IMAP_REPORT_ADDRESS:-}" ] || args+=(--report-address="$IMAP_REPORT_ADDRESS")
+
+    info "Adding the mailbox"
+    # The password goes through the environment, like the settings above.
+    if (
+        export DMARCO_MAILBOX_PASSWORD="$IMAP_PASSWORD"
+        compose exec -T -e DMARCO_MAILBOX_PASSWORD php bin/console app:mailbox:add "${args[@]}" 2>&1 |
+            sed '/^[[:space:]]*$/d; s/^/     /'
+    ); then
+        MAILBOX_ADDED=1
+    else
+        warn "DMARCo is not reading the mailbox yet. Fix it under Report intake on the Platform page."
+    fi
+}
+
+create_api_key() {
+    info "Creating an API key for report uploads"
+    API_KEY="$(compose exec -T php bin/console app:intake:api-key:create "install.sh" --enable-api --quiet-key 2> /dev/null |
+        tr -d '\r' | grep '^dmarco_' | tail -n 1 || true)"
+    if [ -n "$API_KEY" ]; then
+        ok "API key, shown at the end, once"
+    else
+        warn "Could not create the key. Create one on the Platform page, under Report intake."
+    fi
+}
+
+account_exists() {
+    local count
+    count="$(compose exec -T database psql --quiet --no-psqlrc -At \
+        --username "${POSTGRES_USER:-dmarco}" --dbname "${POSTGRES_DB:-dmarco}" \
+        -c 'SELECT count(*) FROM "user"' 2> /dev/null | tr -d '\r')" || return 1
+    case "$count" in
+        '' | *[!0-9]*) return 1 ;;
+    esac
+    [ "$count" -gt 0 ]
+}
+
 configure_application() {
     if [ -z "${BACKEND_READY:-}" ]; then
-        warn "Skipping the JWT keys and the first account until the backend runs."
+        warn "Skipping the JWT keys, the report intake, and the first account until the backend runs."
         return 0
     fi
 
@@ -481,6 +878,18 @@ configure_application() {
         ok "JWT keys"
     else
         warn "Could not generate JWT keys. Retry with: docker compose exec php bin/console lexik:jwt:generate-keypair --skip-if-exists"
+        return 0
+    fi
+
+    settle_environment
+    import_new_settings
+    [ -z "${INTAKE_IMAP:-}" ] || add_mailbox
+    [ -z "${INTAKE_API:-}" ] || create_api_key
+
+    # DMARCo has one account, and an install over an earlier one has it already.
+    if account_exists; then
+        ACCOUNT_CREATED=1
+        ok "Your account is already there"
         return 0
     fi
 
@@ -499,10 +908,12 @@ configure_application() {
     fi
 }
 
+# ----------------------------------------------------------------- summary
+
 print_summary() {
     local scheme="${APP_SCHEME:-https}"
-    local url="${scheme}://${APP_DOMAIN}"
-    REPORT_DOMAIN="${REPORT_DOMAIN:-$APP_DOMAIN}"
+    local url="${scheme}://${APP_DOMAIN}" step=1 gateway_domain report_domain
+    gateway_domain="${MAIL_GATEWAY_DOMAIN:-${REPORT_DOMAIN:-$APP_DOMAIN}}"
     SMTP_HOSTNAME="${SMTP_HOSTNAME:-$APP_DOMAIN}"
 
     if [ -n "${BACKEND_READY:-}" ]; then
@@ -514,61 +925,109 @@ print_summary() {
             "$C_DIM" "$INSTALL_DIR" "$C_RESET"
     fi
 
-    cat <<- EOF
+    cat <<EOF
 
-		  Dashboard      ${C_BOLD}${url}${C_RESET}
-		  Directory      ${INSTALL_DIR}
+  Dashboard      ${C_BOLD}${url}${C_RESET}
+  Directory      ${INSTALL_DIR}
 
-		${C_BOLD}1. DNS records${C_RESET}
+${C_BOLD}${step}. DNS records${C_RESET}
 
-		     ${APP_DOMAIN}.  A    <this server's IPv4 address>
-		     ${REPORT_DOMAIN}.  MX   10 ${SMTP_HOSTNAME}.
-		     *._report._dmarc.${REPORT_DOMAIN}.  TXT  "v=DMARC1"
-	EOF
+     ${APP_DOMAIN}.  A    <this server's IPv4 address>
+EOF
+    if has_profile mail-gateway; then
+        printf '     %s.  MX   10 %s.\n' "$gateway_domain" "$SMTP_HOSTNAME"
+        printf '     *._report._dmarc.%s.  TXT  "v=DMARC1"\n' "$gateway_domain"
+        if [ "$SMTP_HOSTNAME" != "$APP_DOMAIN" ]; then
+            printf '     %s.  A    %s\n' "$SMTP_HOSTNAME" "<this server's IPv4 address>"
+        fi
+        cat <<EOF
 
-    if [ "$SMTP_HOSTNAME" != "$APP_DOMAIN" ]; then
-        printf '     %s.  A   %s\n' "$SMTP_HOSTNAME" "<this server's IPv4 address>"
+   For the mail gateway: port 25 must reach this server, and some hosting
+   providers block it until asked. The TXT record lets other domains send
+   their reports to ${gateway_domain}.
+EOF
+    fi
+    step=$((step + 1))
+
+    cat <<EOF
+
+${C_BOLD}${step}. Point your domains at DMARCo${C_RESET}
+
+EOF
+    if [ -n "${INTAKE_IMAP:-}" ] && [ -n "${IMAP_REPORT_ADDRESS:-}" ]; then
+        report_domain="${IMAP_REPORT_ADDRESS#*@}"
+        cat <<EOF
+   Each domain's DMARC record sends its reports to the mailbox:
+
+     _dmarc.example.com.  TXT  "v=DMARC1; p=none; rua=mailto:${IMAP_REPORT_ADDRESS}"
+
+   Mailbox providers send reports for a domain other than ${report_domain} only
+   when ${report_domain} agrees, with this record on it:
+
+     *._report._dmarc.${report_domain}.  TXT  "v=DMARC1"
+
+EOF
+    fi
+    cat <<EOF
+   Sign in and add a domain: DMARCo shows the record to publish, with the
+   report addresses it can take reports at.
+EOF
+    if [ -n "${MAILBOX_ADDED:-}" ]; then
+        printf '\n   DMARCo reads the mailbox within five minutes, and every 15 minutes after that.\n'
+    fi
+    step=$((step + 1))
+
+    if [ -n "${API_KEY:-}" ]; then
+        cat <<EOF
+
+${C_BOLD}${step}. Upload reports${C_RESET}
+
+   The API key, shown this once. Only a hash of it is kept:
+
+     ${C_BOLD}${API_KEY}${C_RESET}
+
+     curl --fail -X POST -H "Authorization: Bearer <key>" \\
+       -H "Content-Type: application/octet-stream" \\
+       --data-binary @report.xml.gz ${url}/api/v1/intake/reports
+EOF
+        step=$((step + 1))
     fi
 
-    cat <<- EOF
+    cat <<EOF
 
-		   The TXT record is what lets other domains send their reports here.
-		   Without it, providers stop sending reports for every domain outside
-		   ${REPORT_DOMAIN}.
+${C_BOLD}${step}. Everyday commands${C_RESET}
 
-		   Port 25 must reach this server. Some hosting providers block it by
-		   default and unblock it on request.
-
-		${C_BOLD}2. Point your domains at DMARCo${C_RESET}
-
-		   Sign in, add a domain, and DMARCo gives you the address to put in its
-		   DMARC record, for example:
-
-		     _dmarc.example.com.  TXT  "v=DMARC1; p=none; rua=mailto:<address>@${REPORT_DOMAIN}"
-
-		${C_BOLD}3. Everyday commands${C_RESET}
-
-		   cd ${INSTALL_DIR}
-		   docker compose ps
-		   docker compose logs -f
-		   docker compose pull && docker compose up -d --remove-orphans  # upgrade
-	EOF
+   cd ${INSTALL_DIR}
+   docker compose ps
+   docker compose logs -f
+   docker compose pull && docker compose up -d --remove-orphans  # upgrade
+EOF
 
     if [ -z "${ACCOUNT_CREATED:-}" ]; then
-        cat <<- EOF
+        cat <<EOF
 
-			${C_BOLD}Create your account${C_RESET}
+${C_BOLD}Create your account${C_RESET}
 
-			   docker compose exec php bin/console app:user:create
-		EOF
+   docker compose exec php bin/console app:user:create
+EOF
     fi
 
-    cat <<- EOF
+    if [ -n "${ENV_BACKUP:-}" ]; then
+        cat <<EOF
 
-		${C_DIM}Two-factor authentication with an authenticator app is in your profile.
-		Full documentation: https://github.com/${REPO}${C_RESET}
+${C_BOLD}The previous .env${C_RESET} is saved as ${ENV_BACKUP}. It holds the
+settings that moved into the database, passwords among them. Delete it once
+DMARCo works.
+EOF
+    fi
 
-	EOF
+    cat <<EOF
+
+${C_DIM}Mailboxes, API keys, outgoing email, and two-factor authentication are on the
+dashboard: the first three on the Platform page, the last in your profile.
+Full documentation: https://github.com/${REPO}${C_RESET}
+
+EOF
 }
 
 main() {
@@ -599,8 +1058,10 @@ main() {
 
     if [ -f "${INSTALL_DIR}/.env" ]; then
         warn "${INSTALL_DIR}/.env already exists."
-        if confirm "Keep it and only restart the stack?"; then
+        if confirm "Keep it and upgrade or restart the stack?"; then
             load_existing_configuration
+            ensure_encryption_key
+            keep_gateway_running
         else
             confirm "Overwrite the existing configuration?" ||
                 die "Nothing to do."

@@ -3,26 +3,29 @@ name: dmarco
 x-backend-image: &backend-image ghcr.io/dmarcoapp/backend:${BACKEND_VERSION:-latest}
 
 x-backend-environment: &backend-environment
-  APP_DMARC_AGGREGATE_REPORT_EMAIL_RECEIVER_DOMAIN: ${REPORT_DOMAIN:?Set REPORT_DOMAIN in .env}
-  APP_EMAIL_SENDER_ADDRESS: ${APP_EMAIL_SENDER_ADDRESS:-no-reply@${APP_DOMAIN}}
+  # Encrypts the passwords and secrets kept in the database. Without it the
+  # backend reads its settings from the variables below, the way 0.4 did, and
+  # mailboxes and API keys stay unavailable. install.sh generates it.
+  APP_ENCRYPTION_KEY: ${APP_ENCRYPTION_KEY:-}
   APP_FRONTEND_URL: ${APP_SCHEME:-https}://${APP_DOMAIN:?Set APP_DOMAIN in .env}
-  APP_INBOUND_REPORT_EMAIL_WEBHOOK_SECRET: ${WEBHOOK_SECRET:?Set WEBHOOK_SECRET in .env}
-  APP_IP_LOOKUP_ENABLED: ${APP_IP_LOOKUP_ENABLED:-true}
-  # Backends before 0.3 had public sign-up and read this. It keeps a pinned
-  # older image closed, and newer ones ignore it.
-  APP_REGISTRATION_ENABLED: "false"
-  APP_REPORT_RETENTION_DAYS: ${APP_REPORT_RETENTION_DAYS:-365}
   APP_SECRET: ${APP_SECRET:?Set APP_SECRET in .env}
   CORS_ALLOW_ORIGIN: ${CORS_ALLOW_ORIGIN:?Set CORS_ALLOW_ORIGIN in .env}
   DATABASE_URL: postgresql://${POSTGRES_USER:-dmarco}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@database:5432/${POSTGRES_DB:-dmarco}?serverVersion=${POSTGRES_VERSION:-16}&charset=utf8
   DEFAULT_URI: ${APP_SCHEME:-https}://${APP_DOMAIN}
   LOCK_DSN: redis://redis
-  # Outgoing mail only carries notifications, so without an SMTP account the
-  # null transport accepts them and sends nothing.
-  MAILER_DSN: ${MAILER_DSN:-null://null}
   MESSENGER_ASYNC_HIGH_TRANSPORT_DSN: amqp://${RABBITMQ_USER:-dmarco}:${RABBITMQ_PASSWORD:?Set RABBITMQ_PASSWORD in .env}@rabbitmq:5672/%2f/messages
   MESSENGER_ASYNC_LOW_TRANSPORT_DSN: amqp://${RABBITMQ_USER:-dmarco}:${RABBITMQ_PASSWORD}@rabbitmq:5672/%2f/messages
   REDIS_DSN: redis://redis
+  # Settings that live in the database now, set on the dashboard's Platform
+  # page. An .env from 0.4 still holds them: the first start with an
+  # APP_ENCRYPTION_KEY takes them over, and install.sh then removes them from
+  # .env. Empty, as they are after that, the backend ignores them.
+  APP_DMARC_AGGREGATE_REPORT_EMAIL_RECEIVER_DOMAIN: ${REPORT_DOMAIN:-}
+  APP_EMAIL_SENDER_ADDRESS: ${APP_EMAIL_SENDER_ADDRESS:-}
+  APP_INBOUND_REPORT_EMAIL_WEBHOOK_SECRET: ${WEBHOOK_SECRET:-}
+  APP_IP_LOOKUP_ENABLED: ${APP_IP_LOOKUP_ENABLED:-}
+  APP_REPORT_RETENTION_DAYS: ${APP_REPORT_RETENTION_DAYS:-}
+  MAILER_DSN: ${MAILER_DSN:-}
 
 services:
   # ----------------------------------------------------------------- web entry
@@ -54,8 +57,6 @@ services:
     restart: unless-stopped
     environment:
       DMARCO_API_BASE_URL: /api
-      # Hides the sign-up link of a pinned dashboard before 0.3.
-      DMARCO_DISABLE_REGISTRATION: "true"
       DMARCO_MOCK_MODE: "false"
 
   # ------------------------------------------------------------------- backend
@@ -103,15 +104,21 @@ services:
       php:
         condition: service_started
 
-  # -------------------------------------------------------------- inbound mail
+  # ------------------------------------------------- mail gateway (opt-in, old)
+  # Receives report email on port 25 and posts each report to the backend. Off
+  # unless COMPOSE_PROFILES in .env names mail-gateway. Mailboxes read over
+  # IMAP, and uploads with an API key, need none of it.
   postfix:
     image: ghcr.io/dmarcoapp/mail-inbound/postfix:${MAIL_INBOUND_VERSION:-latest}
+    profiles:
+      - mail-gateway
     restart: unless-stopped
     environment:
-      ACCEPTED_RCPT_DOMAIN: ${REPORT_DOMAIN}
+      # REPORT_DOMAIN is the name an .env from 0.4 has for it.
+      ACCEPTED_RCPT_DOMAIN: ${MAIL_GATEWAY_DOMAIN:-${REPORT_DOMAIN:-${APP_DOMAIN}}}
       MAX_MESSAGE_BYTES: ${MAX_MESSAGE_BYTES:-10485760}
       SELF_SIGNED_CERT_DAYS: ${SELF_SIGNED_CERT_DAYS:-3650}
-      SMTP_HOSTNAME: ${SMTP_HOSTNAME:?Set SMTP_HOSTNAME in .env}
+      SMTP_HOSTNAME: ${SMTP_HOSTNAME:-${APP_DOMAIN}}
       SMTP_TLS_CHAIN_FILE: ${SMTP_TLS_CHAIN_FILE:-/certs/smtp.pem}
       SMTP_TLS_MODE: ${SMTP_TLS_MODE:-self-signed}
     ports:
@@ -127,10 +134,12 @@ services:
 
   processor:
     image: ghcr.io/dmarcoapp/mail-inbound/processor:${MAIL_INBOUND_VERSION:-latest}
+    profiles:
+      - mail-gateway
     restart: unless-stopped
     environment:
       CLAMAV_SCAN_ENABLED: ${CLAMAV_SCAN_ENABLED:-true}
-      SMTP_HOSTNAME: ${SMTP_HOSTNAME}
+      SMTP_HOSTNAME: ${SMTP_HOSTNAME:-${APP_DOMAIN}}
       WEBHOOK_URL: http://php/v1/webhook/inbound_report_email
     secrets:
       - webhook_secret
@@ -150,6 +159,8 @@ services:
 
   clamav:
     image: clamav/clamav-debian:1.4
+    profiles:
+      - mail-gateway
     restart: unless-stopped
     volumes:
       - ./clamav/clamd.conf:/etc/clamav/clamd.conf:ro
@@ -161,7 +172,7 @@ services:
       timeout: 10s
       retries: 3
 
-  # ---------------------------------- publicly trusted MX certificate (opt-in)
+  # -------------- publicly trusted certificate for the mail gateway (opt-in)
   certbot:
     image: ghcr.io/dmarcoapp/mail-inbound/certbot:${MAIL_INBOUND_VERSION:-latest}
     profiles:
@@ -169,7 +180,7 @@ services:
     restart: unless-stopped
     environment:
       CERT_EMAIL: ${ACME_EMAIL}
-      SMTP_HOSTNAME: ${SMTP_HOSTNAME}
+      SMTP_HOSTNAME: ${SMTP_HOSTNAME:-${APP_DOMAIN}}
     secrets:
       - cloudflare_api_token
     volumes:
@@ -182,7 +193,7 @@ services:
       - letsencrypt
     restart: unless-stopped
     environment:
-      SMTP_HOSTNAME: ${SMTP_HOSTNAME}
+      SMTP_HOSTNAME: ${SMTP_HOSTNAME:-${APP_DOMAIN}}
     depends_on:
       certbot:
         condition: service_started
