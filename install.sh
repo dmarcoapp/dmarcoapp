@@ -501,7 +501,7 @@ keep_existing_secrets() {
 load_existing_configuration() {
     load_env_values APP_DOMAIN APP_SCHEME REPORT_DOMAIN MAIL_GATEWAY_DOMAIN SMTP_HOSTNAME \
         COMPOSE_PROFILES APP_ENCRYPTION_KEY POSTGRES_USER POSTGRES_PASSWORD POSTGRES_DB \
-        RABBITMQ_USER RABBITMQ_PASSWORD || true
+        RABBITMQ_USER RABBITMQ_PASSWORD BACKEND_VERSION DASHBOARD_VERSION || true
 }
 
 # An .env from before 0.5 has no APP_ENCRYPTION_KEY. Until it has one, the
@@ -535,6 +535,150 @@ gateway off afterwards."
     add_profile mail-gateway
     env_set COMPOSE_PROFILES "$COMPOSE_PROFILES"
     ok "COMPOSE_PROFILES=${COMPOSE_PROFILES}"
+}
+
+# The containers of this install, by Compose service, whatever compose.yaml
+# now says: an upgrade looks at what the previous version left running.
+project_container() {
+    docker ps -aq \
+        --filter "label=com.docker.compose.project=${COMPOSE_PROJECT_NAME:-dmarco}" \
+        --filter "label=com.docker.compose.service=$1" 2> /dev/null | head -n 1
+}
+
+# True for a version tag below 0.5, such as 0.4 or v0.3.2. A tag that is not a
+# version, latest among them, passes.
+version_below_0_5() {
+    local tag="${1#v}" major minor
+    case "$tag" in
+        [0-9]*.[0-9]*) ;;
+        *) return 1 ;;
+    esac
+    major="${tag%%.*}"
+    minor="${tag#*.}"
+    minor="${minor%%.*}"
+    case "$major$minor" in
+        *[!0-9]*) return 1 ;;
+    esac
+    [ "$major" -eq 0 ] && [ "$minor" -lt 5 ]
+}
+
+# This recipe needs 0.5 or later. A backend or dashboard pinned below that
+# would start without the settings, mailboxes, and keys the recipe sets up, so
+# the pin is raised, or the run stops before anything changes.
+raise_pinned_versions() {
+    local name value
+    for name in BACKEND_VERSION DASHBOARD_VERSION; do
+        value="${!name:-}"
+        if [ -z "$value" ] || ! version_below_0_5 "$value"; then
+            continue
+        fi
+
+        warn "${name} is pinned to ${value}, and this recipe needs 0.5 or later."
+        confirm "Raise ${name} to 0.5?" ||
+            die "Stopped. Neither .env nor the running stack was changed, and this recipe needs 0.5 or later."
+        printf -v "$name" '%s' '0.5'
+        if [ -f "${INSTALL_DIR}/.env" ] && env_file_has "$name"; then
+            backup_env
+            env_set "$name" '0.5'
+        fi
+        ok "${name}=0.5"
+    done
+}
+
+# The messages waiting in the broker of the previous install, or nothing when
+# there is no broker container to ask.
+queued_messages() {
+    local id="$1" output waited=0
+    while [ "$waited" -lt 120 ]; do
+        if output="$(docker exec "$id" rabbitmqctl -q list_queues messages 2> /dev/null)"; then
+            printf '%s\n' "$output" | awk '$1 ~ /^[0-9]+$/ { total += $1 } END { print total + 0 }'
+            return 0
+        fi
+        sleep 3
+        waited=$((waited + 3))
+    done
+    return 1
+}
+
+# Up to 0.3 a queued report only pointed at its copy in the MinIO object store,
+# which 0.4 dropped. Those reports have to be processed by the version that
+# queued them, before the stack moves on and MinIO goes.
+drain_object_storage_queue() {
+    local broker worker gateway count waited=0
+    [ -n "$(project_container minio)" ] || [ -f "${INSTALL_DIR}/secrets/s3_access_key.txt" ] || return 0
+
+    broker="$(project_container rabbitmq)"
+    if [ -z "$broker" ]; then
+        remove_object_storage_settings
+        return 0
+    fi
+
+    info "Finishing the reports queued by the previous version"
+    docker start "$broker" > /dev/null 2>&1 || true
+    count="$(queued_messages "$broker")" ||
+        die "Could not ask the message broker how many reports are queued. Check: docker logs ${broker}"
+    if [ "$count" -eq 0 ]; then
+        ok "Nothing queued"
+        remove_object_storage_settings
+        return 0
+    fi
+
+    # No new mail while the queue empties. Sending servers retry it later.
+    for gateway in postfix processor; do
+        gateway="$(project_container "$gateway")"
+        [ -z "$gateway" ] || docker stop "$gateway" > /dev/null 2>&1 || true
+    done
+    worker="$(project_container worker)"
+    [ -n "$worker" ] ||
+        die "${count} reports are queued for the previous version, and its worker container is gone. Start that version again until they are processed, then run the installer again."
+    docker start "$worker" > /dev/null 2>&1 || true
+    note "     ${count} queued. The previous version processes them now, which can take a few minutes."
+
+    while [ "$waited" -lt 900 ]; do
+        sleep 10
+        waited=$((waited + 10))
+        count="$(queued_messages "$broker")" || count=''
+        if [ "$count" = 0 ]; then
+            ok "Queue empty"
+            remove_object_storage_settings
+            return 0
+        fi
+    done
+    die "${count:-Some} reports are still queued after 15 minutes. Check the previous worker with: docker logs ${worker}. Run the installer again once docker exec ${broker} rabbitmqctl list_queues shows 0."
+}
+
+# What the object store left in the configuration. Its data volume stays,
+# because deleting data is the operator's call. The summary says how.
+remove_object_storage_settings() {
+    local stale=() key
+    for key in S3_ACCESS_KEY S3_SECRET_KEY S3_RETENTION_DAYS; do
+        if env_file_has "$key"; then
+            stale+=("$key")
+        fi
+    done
+    if [ "${#stale[@]}" -gt 0 ]; then
+        backup_env
+        env_remove "${stale[@]}"
+    fi
+    rm -f "${INSTALL_DIR}/secrets/s3_access_key.txt" "${INSTALL_DIR}/secrets/s3_secret_key.txt"
+    OBJECT_STORAGE_REMOVED=1
+}
+
+# 0.5 serves one account, and its migration stops on a database with more,
+# because which ones to keep is the operator's decision. Asked before the new
+# backend starts, so the previous version can still delete them.
+check_single_account() {
+    local user="${POSTGRES_USER:-dmarco}" db="${POSTGRES_DB:-dmarco}" accounts count
+    accounts="$(compose exec -T database psql --quiet --no-psqlrc -At --username "$user" --dbname "$db" \
+        -c 'SELECT email FROM "user" ORDER BY created_at' 2> /dev/null | tr -d '\r')" || return 0
+    count="$(printf '%s\n' "$accounts" | grep -c .)" || true
+    [ "${count:-0}" -gt 1 ] || return 0
+
+    warn "This database has ${count} accounts, and DMARCo now serves one:"
+    printf '%s\n' "$accounts" | sed 's/^/       /' >&2
+    warn "Delete the ones you do not need with the version you are upgrading from, which deletes their domains and reports as well, then run the installer again:"
+    printf '       cd %s\n       BACKEND_VERSION=0.4 docker compose run --rm php bin/console app:user:delete\n' "$INSTALL_DIR" >&2
+    die "Stopped before the new version started. Nothing in the database was changed."
 }
 
 # Docker volumes outlive the install directory, so an install that starts
@@ -662,6 +806,7 @@ start_stack() {
         die "Could not start them. See what went wrong with: cd ${INSTALL_DIR} && docker compose logs database rabbitmq"
     if wait_for_service database 300 && wait_for_service rabbitmq 300; then
         sync_credentials
+        check_single_account
     else
         warn "The database or the message broker did not come up. Check: docker compose logs database rabbitmq"
     fi
@@ -836,7 +981,7 @@ add_mailbox() {
     # The password goes through the environment, like the settings above.
     if (
         export DMARCO_MAILBOX_PASSWORD="$IMAP_PASSWORD"
-        compose exec -T -e DMARCO_MAILBOX_PASSWORD php bin/console app:mailbox:add "${args[@]}" 2>&1 |
+        compose exec -T -e DMARCO_MAILBOX_PASSWORD php bin/console app:intake:mailbox:add "${args[@]}" 2>&1 |
             sed '/^[[:space:]]*$/d; s/^/     /'
     ); then
         MAILBOX_ADDED=1
@@ -1012,6 +1157,15 @@ ${C_BOLD}Create your account${C_RESET}
 EOF
     fi
 
+    if [ -n "${OBJECT_STORAGE_REMOVED:-}" ] && docker volume inspect "${COMPOSE_PROJECT_NAME:-dmarco}_minio_data" > /dev/null 2>&1; then
+        cat <<EOF
+
+${C_BOLD}MinIO's data${C_RESET} is no longer used. Once DMARCo works, delete it with:
+
+   docker volume rm ${COMPOSE_PROJECT_NAME:-dmarco}_minio_data
+EOF
+    fi
+
     if [ -n "${ENV_BACKUP:-}" ]; then
         cat <<EOF
 
@@ -1059,12 +1213,24 @@ main() {
     if [ -f "${INSTALL_DIR}/.env" ]; then
         warn "${INSTALL_DIR}/.env already exists."
         if confirm "Keep it and upgrade or restart the stack?"; then
+            # Every release that changes what an install needs adds its
+            # upgrade step here, breaking changes above all. Each step checks
+            # what is on disk rather than a version number and does nothing
+            # once applied, so an install of any age reaches the new version
+            # in one run, and a plain restart changes nothing.
             load_existing_configuration
+            drain_object_storage_queue
+            raise_pinned_versions
             ensure_encryption_key
             keep_gateway_running
         else
             confirm "Overwrite the existing configuration?" ||
                 die "Nothing to do."
+            drain_object_storage_queue
+            raise_pinned_versions
+            # The old file holds secrets the data depends on, and settings
+            # that only reach the database once the new version runs.
+            backup_env
             keep_existing_secrets
             collect_configuration
             write_configuration

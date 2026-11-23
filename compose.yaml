@@ -140,7 +140,7 @@ services:
     environment:
       CLAMAV_SCAN_ENABLED: ${CLAMAV_SCAN_ENABLED:-true}
       SMTP_HOSTNAME: ${SMTP_HOSTNAME:-${APP_DOMAIN}}
-      WEBHOOK_URL: http://php/v1/webhook/inbound_report_email
+      WEBHOOK_URL: http://php/v1/intake/webhook
     secrets:
       - webhook_secret
     volumes:

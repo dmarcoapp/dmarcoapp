@@ -129,7 +129,7 @@ docker compose exec php bin/console app:user:create
 
 `--wait` returns once every container reports healthy, which on the first run
 means waiting for the database migrations. Sign in and add your mailbox on the
-Platform page, under Report intake.
+Platform page, under Report Intake.
 
 ## DNS records
 
@@ -184,7 +184,7 @@ cannot go to an address at a mail provider's domain.
 ## Report intake
 
 Mailboxes, API keys, and the mail gateway's settings are on the dashboard's
-Platform page, under Report intake. Any of them can carry reports for any of
+Platform page, under Report Intake. Any of them can carry reports for any of
 your domains, side by side.
 
 ### Mailboxes over IMAP
@@ -207,16 +207,16 @@ The Test button signs in and lists the folders, and the log shows what each read
 found and skipped. The same is available on the server:
 
 ```bash
-docker compose exec php bin/console app:mailbox:list
-docker compose exec php bin/console app:mailbox:test <name>
-docker compose exec php bin/console app:mailbox:poll <name>
+docker compose exec php bin/console app:intake:mailbox:list
+docker compose exec php bin/console app:intake:mailbox:test <name>
+docker compose exec php bin/console app:intake:mailbox:poll <name>
 ```
 
-### Uploads with an API key
+### Upload endpoint
 
-With "Take reports through the API" on, create a key on the Platform page and
-send each report file to the API, as XML or the gzip or zip it came in, up to
-10 MB:
+On the Platform page, under Report Intake, switch on the API and its upload
+endpoint, create a key, and send each report file, as XML or the gzip or zip it
+came in, up to 10 MB:
 
 ```bash
 curl --fail -X POST \
@@ -229,7 +229,7 @@ curl --fail -X POST \
 The answer is `202` when the report is stored, `200` when it was stored before,
 and `422` with the reason when the file is not a report. Each address may make
 600 requests an hour. Only a hash of each key is kept, so a lost key is revoked
-and replaced. With the switch off, the API answers `404`.
+and replaced. While the API or the upload endpoint is off, it answers `404`.
 
 ### Mail gateway
 
@@ -248,9 +248,9 @@ MAIL_GATEWAY_DOMAIN=dmarc.example.com
 SMTP_HOSTNAME=dmarc.example.com
 ```
 
-On the Platform page, under Report intake, switch on "Take reports through the
-API", set the report address domain to the same `MAIL_GATEWAY_DOMAIN`, and make
-a webhook secret. Put that secret where the gateway reads it, then start the
+On the Platform page, under Report Intake, switch on the API and its webhook,
+set the report domain to the same `MAIL_GATEWAY_DOMAIN`, and generate a webhook
+secret. Put that secret where the gateway reads it, then start the
 gateway:
 
 ```bash
@@ -354,8 +354,8 @@ Postfix reads the file at startup, so restart it after a renewal.
 
 Everything else is on the dashboard's Platform page and kept in the database:
 report retention, IP lookups, outgoing email and its sender address, mailboxes,
-API keys, and the mail gateway's domain and secret. Outgoing email is optional,
-and the page sends a test email to check it.
+the API switches, API keys, and the webhook's domain and secret. Outgoing email
+is optional, and the page sends a test email to check it.
 
 Keep `APP_ENCRYPTION_KEY` with your backups. Without it, the stored passwords
 cannot be read, and each has to be entered again.
@@ -437,23 +437,33 @@ docker compose up -d --remove-orphans
 migrations run automatically on start. Pin the `*_VERSION` settings in `.env`
 to release tags if you would rather decide when new versions land.
 
-#### From 0.4
+#### From 0.4 or earlier
 
 From 0.5, outgoing email, report retention, IP lookups, the report domain, and
-the webhook secret live in the database, and the mail gateway runs only with
-the `mail-gateway` profile. Run the installer again in the install directory
-and keep the existing `.env`:
+the webhook secret live in the database, the mail gateway runs only with the
+`mail-gateway` profile, and DMARCo serves one account. Run the installer again
+in the install directory and keep the existing `.env`:
 
 ```bash
 cd dmarco
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/dmarcoapp/dmarcoapp/main/install.sh)"
 ```
 
-It saves the old `.env` next to it, adds `APP_ENCRYPTION_KEY`, keeps the mail
-gateway on, starts the new version, and removes the lines whose settings the
-database took over. `REPORT_DOMAIN` becomes `MAIL_GATEWAY_DOMAIN`, which the
+Before the new version starts, it:
+
+- Lets the previous version process the reports still queued for MinIO, on an
+  install from 0.3 or earlier, then removes the MinIO settings and secrets
+- Offers to raise `BACKEND_VERSION` and `DASHBOARD_VERSION` when they are
+  pinned below 0.5
+- Stops when the database holds more than one account, lists them, and prints
+  the command that deletes one with the previous version
+
+Then it saves the old `.env` next to it, adds `APP_ENCRYPTION_KEY`, keeps the
+mail gateway on, starts the new version, and removes the lines whose settings
+the database took over. `REPORT_DOMAIN` becomes `MAIL_GATEWAY_DOMAIN`, which the
 gateway still reads. Delete the saved copy once everything works, because it
-holds those settings, passwords among them.
+holds those settings, passwords among them. The installer can be run again at
+any point, and does each step only once.
 
 By hand, get the new `compose.yaml` and add to `.env`:
 
@@ -468,20 +478,17 @@ with the key, and the Platform page lists the lines of `.env` that can go. Once
 a key, the backend keeps reading those lines, as 0.4 did, and offers no
 mailboxes or API keys.
 
-#### From 0.3 or earlier
-
 Up to 0.3, a report went to a MinIO object store first, and the message queued
-for the backend only pointed at it. From 0.4 the report travels inside that
-message, so let the reports already on their way finish before you switch:
+for the backend only pointed at it, so those messages have to be processed
+before the switch. By hand, stop the gateway and wait for the queue to empty:
 
 ```bash
 docker compose stop postfix processor
 docker compose exec rabbitmq rabbitmqctl list_queues name messages
 ```
 
-Once `messages` shows `0`, upgrade as from 0.4 above, and raise any
-`*_VERSION` pinned to an older release. Mail that arrives in the meantime is
-retried by the servers sending it. Afterwards, remove what MinIO left behind:
+Once `messages` shows `0`, continue as above. Mail that arrives in the meantime
+is retried by the servers sending it. Afterwards, remove what MinIO left behind:
 
 ```bash
 docker volume rm dmarco_minio_data
@@ -531,7 +538,7 @@ backend refuses report email for a reason that waiting cannot fix, such as a
 webhook secret that differs between the Platform page and
 `secrets/webhook_secret.txt`, the processor keeps each refused report instead
 of dropping it. So does a report that still fails after about five days of
-retries, which is what happens while API intake is switched off. `docker
+retries, which is what happens while the webhook is switched off. `docker
 compose logs processor` names the cause. Fix it, then send the kept reports
 through again:
 

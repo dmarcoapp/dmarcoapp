@@ -37,6 +37,13 @@ in mind. It is a small project; a short conversation saves a large rewrite.
 - Update the documentation in the same pull request when behavior changes.
 - New configuration must reach the installed stack: add it to `.env.example`,
   `compose.yaml`, and the README table here as well.
+- Running the installer again over an install is how it upgrades, so every
+  release that changes what an install needs ships its upgrade step in
+  `install.sh`, in the branch that keeps the existing `.env`. This matters most
+  for breaking changes: a setting renamed or removed, a service added, replaced,
+  or dropped, data that has to move. The step checks what is on disk rather
+  than a version number and does nothing once applied, so an install of any age
+  reaches the new version in one run without editing files by hand.
 
 ## Commits
 
