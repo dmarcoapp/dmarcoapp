@@ -12,10 +12,12 @@ x-backend-environment: &backend-environment
   CORS_ALLOW_ORIGIN: ${CORS_ALLOW_ORIGIN:?Set CORS_ALLOW_ORIGIN in .env}
   DATABASE_URL: postgresql://${POSTGRES_USER:-dmarco}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@database:5432/${POSTGRES_DB:-dmarco}?serverVersion=${POSTGRES_VERSION:-16}&charset=utf8
   DEFAULT_URI: ${APP_SCHEME:-https}://${APP_DOMAIN}
-  LOCK_DSN: redis://redis
-  MESSENGER_ASYNC_HIGH_TRANSPORT_DSN: amqp://${RABBITMQ_USER:-dmarco}:${RABBITMQ_PASSWORD:?Set RABBITMQ_PASSWORD in .env}@rabbitmq:5672/%2f/messages
-  MESSENGER_ASYNC_LOW_TRANSPORT_DSN: amqp://${RABBITMQ_USER:-dmarco}:${RABBITMQ_PASSWORD}@rabbitmq:5672/%2f/messages
-  REDIS_DSN: redis://redis
+  # Valkey holds the cache and the locks in database 0 and the work queues in
+  # database 1, one stream for each priority.
+  LOCK_DSN: redis://valkey:6379/0
+  MESSENGER_ASYNC_HIGH_TRANSPORT_DSN: redis://valkey:6379/messages_high/dmarco/worker?dbindex=1
+  MESSENGER_ASYNC_LOW_TRANSPORT_DSN: redis://valkey:6379/messages_low/dmarco/worker?dbindex=1
+  REDIS_DSN: redis://valkey:6379/0
   # Settings that live in the database now, set on the dashboard's Platform
   # page. An .env from 0.4 still holds them: the first start with an
   # APP_ENCRYPTION_KEY takes them over, and install.sh then removes them from
@@ -73,15 +75,14 @@ services:
     depends_on:
       database:
         condition: service_healthy
-      rabbitmq:
-        condition: service_healthy
-      redis:
+      valkey:
         condition: service_healthy
 
   worker:
     image: *backend-image
     restart: unless-stopped
-    command: sh -c "sleep 20 && php bin/console messenger:consume --all --no-ansi --memory-limit=128M --time-limit=3600"
+    # The queues in priority order: a low one waits while a high one has work.
+    command: sh -c "sleep 20 && php bin/console messenger:consume async async_low scheduler_default --no-ansi --memory-limit=128M --time-limit=3600"
     environment:
       <<: *backend-environment
     # The image health check probes the web server, which this container does
@@ -97,9 +98,7 @@ services:
     depends_on:
       database:
         condition: service_healthy
-      rabbitmq:
-        condition: service_healthy
-      redis:
+      valkey:
         condition: service_healthy
       php:
         condition: service_started
@@ -217,35 +216,18 @@ services:
       retries: 10
       start_period: 60s
 
-  redis:
-    image: redis:7-alpine
+  # Cache, locks, and the work queues. The append-only file, written every
+  # second, keeps the queued work across a restart.
+  valkey:
+    image: valkey/valkey:9-alpine
     restart: unless-stopped
+    command: ["valkey-server", "--appendonly", "yes", "--appendfsync", "everysec"]
     volumes:
-      - redis_data:/data
+      - valkey_data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD", "valkey-cli", "ping"]
       timeout: 5s
       retries: 5
-
-  rabbitmq:
-    image: rabbitmq:3.13-management
-    restart: unless-stopped
-    # RabbitMQ keeps its data under its node name, rabbit@<hostname>, and
-    # Compose hands out the container id as the hostname unless it is told
-    # otherwise. A fixed one is what makes the volume outlive the container:
-    # with a new name every time, a recreated container starts on an empty
-    # node and the messages waiting in the queues are left behind.
-    hostname: rabbitmq
-    environment:
-      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD}
-      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-dmarco}
-    volumes:
-      - rabbitmq_data:/var/lib/rabbitmq
-    healthcheck:
-      test: ["CMD", "rabbitmq-diagnostics", "check_running"]
-      timeout: 10s
-      retries: 10
-      start_period: 30s
 
 volumes:
   backend_caddy_config:
@@ -259,8 +241,7 @@ volumes:
   letsencrypt:
   letsencrypt_lib:
   maildrop:
-  rabbitmq_data:
-  redis_data:
+  valkey_data:
 
 secrets:
   cloudflare_api_token:

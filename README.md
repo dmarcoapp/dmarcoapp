@@ -71,7 +71,7 @@ One `docker compose` stack runs all of it:
 | `caddy` | Serves the dashboard and the API on one domain, with automatic HTTPS |
 | `dashboard` | The web UI |
 | `php`, `worker` | API, mailbox reading, and background report processing |
-| `database`, `redis`, `rabbitmq` | Storage and queues |
+| `database`, `valkey` | Storage, and the cache and work queues |
 | `postfix`, `processor`, `clamav` | The mail gateway, only with the `mail-gateway` profile |
 
 ## Requirements
@@ -116,8 +116,8 @@ cp .env.example .env
 nano .env
 ```
 
-Fill in the domains. Replace `generated` in `APP_SECRET`, `POSTGRES_PASSWORD`,
-and `RABBITMQ_PASSWORD` with a long random string each, for example from
+Fill in the domains. Replace `generated` in `APP_SECRET` and
+`POSTGRES_PASSWORD` with a long random string each, for example from
 `openssl rand -hex 24`, and in `APP_ENCRYPTION_KEY` with the 64 characters of
 `openssl rand -hex 32`. Now start everything:
 
@@ -428,14 +428,68 @@ docker compose down               # stop, keeping all data
 
 ### Upgrading
 
+The installer keeps a copy of itself in the install directory. Run it with
+`upgrade`:
+
 ```bash
-docker compose pull
-docker compose up -d --remove-orphans
+cd dmarco
+bash install.sh upgrade
 ```
 
-`--remove-orphans` stops the parts a newer recipe no longer has. Database
-migrations run automatically on start. Pin the `*_VERSION` settings in `.env`
-to release tags if you would rather decide when new versions land.
+It downloads the current installer and stack, continues with that installer,
+and takes the install through every step a newer version needs, without asking
+anything, because the answers are in `.env`. Database migrations run on start.
+Upgrade this way every time, even when a release seems to change only the
+images: whatever else a release needs is in the installer, and nowhere else.
+
+An install from before 0.6 has no copy of the installer yet. Run the one from
+GitHub there, which saves the copy for next time:
+
+```bash
+cd dmarco
+DMARCO_UPGRADE=1 bash -c "$(curl -fsSL https://raw.githubusercontent.com/dmarcoapp/dmarcoapp/main/install.sh)"
+```
+
+Pin the `*_VERSION` settings in `.env` to release tags if you would rather
+decide when new versions land.
+
+#### From 0.5
+
+From 0.6, Valkey keeps the cache and the work queues, in place of Redis and
+RabbitMQ. Run the installer as above. Before the new version starts, it:
+
+- Offers to raise `BACKEND_VERSION` to 0.6 when it is pinned below
+- Stops the API and the mail gateway, lets the previous worker finish what is
+  queued in RabbitMQ, then removes RabbitMQ and `RABBITMQ_PASSWORD` from `.env`
+
+Mail that arrives in the meantime is retried by the servers sending it, and
+mailboxes keep their reports until they are read. The data RabbitMQ and Redis
+kept stays in their volumes, and the installer prints the command that deletes
+it.
+
+By hand, first let the previous version finish its queued work. Stop the API
+and the gateway, and wait for the queue to empty:
+
+```bash
+docker compose stop php postfix processor
+docker compose exec rabbitmq rabbitmqctl list_queues name messages
+```
+
+Once `messages` shows `0`, stop the worker and check once more, because the
+worker queues follow-up work of its own:
+
+```bash
+docker compose stop worker
+docker compose exec rabbitmq rabbitmqctl list_queues name messages
+```
+
+Then get the new `compose.yaml`, remove `RABBITMQ_PASSWORD` from `.env`, and
+pull and start as above. Once everything works, remove what RabbitMQ and Redis
+left behind:
+
+```bash
+docker volume rm dmarco_rabbitmq_data dmarco_redis_data
+```
 
 #### From 0.4 or earlier
 
@@ -449,12 +503,12 @@ cd dmarco
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/dmarcoapp/dmarcoapp/main/install.sh)"
 ```
 
-Before the new version starts, it:
+It takes the install through the steps of 0.6 [from 0.5](#from-05) as well.
+Before the new version starts, it also:
 
 - Lets the previous version process the reports still queued for MinIO, on an
   install from 0.3 or earlier, then removes the MinIO settings and secrets
-- Offers to raise `BACKEND_VERSION` and `DASHBOARD_VERSION` when they are
-  pinned below 0.5
+- Offers to raise `DASHBOARD_VERSION` when it is pinned below 0.5
 - Stops when the database holds more than one account, lists them, and prints
   the command that deletes one with the previous version
 
@@ -465,33 +519,26 @@ gateway still reads. Delete the saved copy once everything works, because it
 holds those settings, passwords among them. The installer can be run again at
 any point, and does each step only once.
 
-By hand, get the new `compose.yaml` and add to `.env`:
+By hand, empty the queues first, as [from 0.5](#from-05) describes. Up to 0.3,
+a report went to a MinIO object store first, and the message queued for the
+backend only pointed at it, so emptying the queue before the switch processes
+those reports too. Then get the new `compose.yaml`, remove `RABBITMQ_PASSWORD`
+from `.env`, and add:
 
 ```bash
 APP_ENCRYPTION_KEY=<the output of openssl rand -hex 32>
 COMPOSE_PROFILES=mail-gateway
 ```
 
-Then upgrade as above. The backend takes the settings over on its first start
-with the key, and the Platform page lists the lines of `.env` that can go. Once
-`REPORT_DOMAIN` is gone, set `MAIL_GATEWAY_DOMAIN` to its value. Until there is
-a key, the backend keeps reading those lines, as 0.4 did, and offers no
-mailboxes or API keys.
-
-Up to 0.3, a report went to a MinIO object store first, and the message queued
-for the backend only pointed at it, so those messages have to be processed
-before the switch. By hand, stop the gateway and wait for the queue to empty:
+Then pull and start as above. The backend takes the settings over on its first
+start with the key, and the Platform page lists the lines of `.env` that can go.
+Once `REPORT_DOMAIN` is gone, set `MAIL_GATEWAY_DOMAIN` to its value. Until
+there is a key, the backend keeps reading those lines, as 0.4 did, and offers no
+mailboxes or API keys. Once everything works, remove what the older releases
+left behind:
 
 ```bash
-docker compose stop postfix processor
-docker compose exec rabbitmq rabbitmqctl list_queues name messages
-```
-
-Once `messages` shows `0`, continue as above. Mail that arrives in the meantime
-is retried by the servers sending it. Afterwards, remove what MinIO left behind:
-
-```bash
-docker volume rm dmarco_minio_data
+docker volume rm dmarco_rabbitmq_data dmarco_redis_data dmarco_minio_data
 rm -f secrets/s3_access_key.txt secrets/s3_secret_key.txt
 ```
 
@@ -558,14 +605,12 @@ and `APP_DOMAIN` has to resolve to this server before it can get a certificate.
 the password of an earlier install. Postgres reads `POSTGRES_PASSWORD` only when
 it creates its data directory, and Docker volumes outlive the directory you
 installed into, so a reinstall with fresh secrets cannot sign in to the data it
-finds. Running `install.sh` again sets the stored passwords from `.env`. By
-hand, with the values from `.env`:
+finds. Running `install.sh` again sets the stored password from `.env`. By
+hand, with the value from `.env`:
 
 ```bash
 docker compose exec database psql -U dmarco -d postgres \
   -c "ALTER ROLE dmarco WITH PASSWORD 'POSTGRES_PASSWORD from .env'"
-docker compose exec rabbitmq \
-  rabbitmqctl change_password dmarco 'RABBITMQ_PASSWORD from .env'
 docker compose up -d
 ```
 

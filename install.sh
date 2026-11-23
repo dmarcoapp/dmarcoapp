@@ -13,12 +13,18 @@
 #   DMARCO_INTAKE=imap IMAP_HOST=imap.example.com IMAP_USERNAME=dmarc@example.com \
 #   IMAP_PASSWORD=... ./install.sh
 #
+# The installer saves a copy of itself in the install directory. Run from there
+# with upgrade, it fetches the current version of itself and of the stack and
+# upgrades without asking. DMARCO_UPGRADE=1 does the same for the command above:
+#
+#   cd dmarco && bash install.sh upgrade
+#
 set -euo pipefail
 
 REPO="${DMARCO_REPO:-dmarcoapp/dmarcoapp}"
 REF="${DMARCO_REF:-main}"
-RAW_BASE="https://raw.githubusercontent.com/${REPO}/${REF}"
-STACK_FILES=(compose.yaml Caddyfile .env.example clamav/clamd.conf clamav/freshclam.conf)
+RAW_BASE="${DMARCO_RAW_BASE:-https://raw.githubusercontent.com/${REPO}/${REF}}"
+STACK_FILES=(compose.yaml Caddyfile .env.example clamav/clamd.conf clamav/freshclam.conf install.sh)
 
 # The settings 0.4 kept in .env, which live in the database from 0.5 on.
 LEGACY_SETTINGS=(REPORT_DOMAIN WEBHOOK_SECRET MAILER_DSN APP_EMAIL_SENDER_ADDRESS
@@ -152,14 +158,19 @@ existing_mx() {
     fi
 }
 
+# Writes next to the target and renames, so a failed download leaves the old
+# file in place, and the copy of this script that bash is running keeps
+# reading the file it opened.
 download() {
     local url="$1" target="$2"
     mkdir -p "$(dirname "$target")"
     if command -v curl > /dev/null 2>&1; then
-        curl -fsSL "$url" -o "$target"
+        curl -fsSL "$url" -o "${target}.download" || { rm -f "${target}.download"; return 1; }
     else
-        wget -qO "$target" "$url"
+        wget -qO "${target}.download" "$url" || { rm -f "${target}.download"; return 1; }
     fi
+    [ "${target##*.}" != sh ] || chmod 755 "${target}.download"
+    mv "${target}.download" "$target"
 }
 
 compose() {
@@ -243,7 +254,7 @@ port_in_use() {
 fetch_stack() {
     local source_dir="$1" file
     if [ -n "$source_dir" ]; then
-        info "Using the Compose stack from ${source_dir}"
+        [ -n "${DMARCO_FETCHED:-}" ] || info "Using the Compose stack from ${source_dir}"
         return 0
     fi
 
@@ -470,12 +481,11 @@ collect_configuration() {
 
     APP_SECRET="${APP_SECRET:-$(generate_secret)}"
     POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-$(generate_secret)}"
-    RABBITMQ_PASSWORD="${RABBITMQ_PASSWORD:-$(generate_secret)}"
     APP_ENCRYPTION_KEY="${APP_ENCRYPTION_KEY:-$(generate_encryption_key)}"
 }
 
-# Postgres and RabbitMQ store the password they are given the first time they
-# initialize their volume and ignore the environment from then on, so freshly
+# Postgres stores the password it is given the first time it initializes its
+# volume and ignores the environment from then on, so freshly
 # generated secrets would lock the stack out of data an earlier install left
 # behind. An overwrite therefore starts from the secrets already on disk, the
 # rest of them included, so nothing signed or encrypted with the old ones
@@ -483,8 +493,7 @@ collect_configuration() {
 # the database instead of being lost with the old file.
 keep_existing_secrets() {
     local stored=''
-    if load_env_values APP_SECRET APP_ENCRYPTION_KEY WEBHOOK_SECRET POSTGRES_PASSWORD \
-        RABBITMQ_PASSWORD; then
+    if load_env_values APP_SECRET APP_ENCRYPTION_KEY WEBHOOK_SECRET POSTGRES_PASSWORD; then
         info "Keeping the secrets from the existing .env, which its data depends on"
     fi
     if [ -z "${WEBHOOK_SECRET:-}" ] && [ -f "${INSTALL_DIR}/secrets/webhook_secret.txt" ]; then
@@ -496,12 +505,12 @@ keep_existing_secrets() {
 }
 
 # What the installer itself needs when it keeps an existing .env: the summary
-# prints the domains, and the passwords have to match what the data stores
-# have. The rest of the file is Compose's business, and Compose reads it.
+# prints the domains, and the password has to match what the database has. The
+# rest of the file is Compose's business, and Compose reads it.
 load_existing_configuration() {
     load_env_values APP_DOMAIN APP_SCHEME REPORT_DOMAIN MAIL_GATEWAY_DOMAIN SMTP_HOSTNAME \
         COMPOSE_PROFILES APP_ENCRYPTION_KEY POSTGRES_USER POSTGRES_PASSWORD POSTGRES_DB \
-        RABBITMQ_USER RABBITMQ_PASSWORD BACKEND_VERSION DASHBOARD_VERSION || true
+        BACKEND_VERSION DASHBOARD_VERSION || true
 }
 
 # An .env from before 0.5 has no APP_ENCRYPTION_KEY. Until it has one, the
@@ -545,10 +554,10 @@ project_container() {
         --filter "label=com.docker.compose.service=$1" 2> /dev/null | head -n 1
 }
 
-# True for a version tag below 0.5, such as 0.4 or v0.3.2. A tag that is not a
-# version, latest among them, passes.
-version_below_0_5() {
-    local tag="${1#v}" major minor
+# True when a version tag is below the minor release 0.<minor>, such as 0.4 or
+# v0.3.2 below 0.5. A tag that is not a version, latest among them, passes.
+version_below() {
+    local tag="${1#v}" wanted="$2" major minor
     case "$tag" in
         [0-9]*.[0-9]*) ;;
         *) return 1 ;;
@@ -559,38 +568,46 @@ version_below_0_5() {
     case "$major$minor" in
         *[!0-9]*) return 1 ;;
     esac
-    [ "$major" -eq 0 ] && [ "$minor" -lt 5 ]
+    [ "$major" -eq 0 ] && [ "$minor" -lt "$wanted" ]
 }
 
-# This recipe needs 0.5 or later. A backend or dashboard pinned below that
-# would start without the settings, mailboxes, and keys the recipe sets up, so
-# the pin is raised, or the run stops before anything changes.
+# The oldest release of each image this recipe works with. The backend needs
+# 0.6, the first with Valkey queues; the dashboard needs 0.5, the first with the
+# Platform page. One pinned below would start without what the recipe sets up,
+# so the pin is raised, or the run stops before anything changes.
 raise_pinned_versions() {
-    local name value
+    local name value minimum
     for name in BACKEND_VERSION DASHBOARD_VERSION; do
+        case "$name" in
+            BACKEND_VERSION) minimum=6 ;;
+            *) minimum=5 ;;
+        esac
         value="${!name:-}"
-        if [ -z "$value" ] || ! version_below_0_5 "$value"; then
+        if [ -z "$value" ] || ! version_below "$value" "$minimum"; then
             continue
         fi
 
-        warn "${name} is pinned to ${value}, and this recipe needs 0.5 or later."
-        confirm "Raise ${name} to 0.5?" ||
-            die "Stopped. Neither .env nor the running stack was changed, and this recipe needs 0.5 or later."
-        printf -v "$name" '%s' '0.5'
+        warn "${name} is pinned to ${value}, and this recipe needs 0.${minimum} or later."
+        confirm "Raise ${name} to 0.${minimum}?" ||
+            die "Stopped. Neither .env nor the running stack was changed, and this recipe needs ${name} 0.${minimum} or later."
+        printf -v "$name" '%s' "0.${minimum}"
         if [ -f "${INSTALL_DIR}/.env" ] && env_file_has "$name"; then
             backup_env
-            env_set "$name" '0.5'
+            env_set "$name" "0.${minimum}"
         fi
-        ok "${name}=0.5"
+        ok "${name}=0.${minimum}"
     done
 }
 
 # The messages waiting in the broker of the previous install, or nothing when
-# there is no broker container to ask.
+# there is no broker container to ask. A broker that has just started answers
+# before it has loaded its queues, and would count none, so the count waits for
+# its startup to finish.
 queued_messages() {
     local id="$1" output waited=0
     while [ "$waited" -lt 120 ]; do
-        if output="$(docker exec "$id" rabbitmqctl -q list_queues messages 2> /dev/null)"; then
+        if docker exec "$id" rabbitmqctl -q await_startup > /dev/null 2>&1 &&
+            output="$(docker exec "$id" rabbitmqctl -q list_queues messages 2> /dev/null)"; then
             printf '%s\n' "$output" | awk '$1 ~ /^[0-9]+$/ { total += $1 } END { print total + 0 }'
             return 0
         fi
@@ -664,6 +681,137 @@ remove_object_storage_settings() {
     OBJECT_STORAGE_REMOVED=1
 }
 
+# Up to 0.5 the work queues lived in RabbitMQ, and from 0.6 they live in Valkey,
+# which already held the cache. Nothing carries the queued work from one to the
+# other, so the previous version finishes it first: with nothing coming in, its
+# worker runs until the queues are empty, and then RabbitMQ goes. The count
+# that decides is taken with the worker stopped, because the worker queues
+# follow-up work of its own.
+drain_message_broker() {
+    local project="${COMPOSE_PROJECT_NAME:-dmarco}" broker worker service count waited=0 temporary=''
+    broker="$(project_container rabbitmq)"
+    if [ -z "$broker" ]; then
+        # After docker compose down the containers are gone, but the volume
+        # may still hold queued work. A broker of its own on it can tell. Once
+        # the RabbitMQ settings are out of .env, that question was answered.
+        env_file_has RABBITMQ_PASSWORD || return 0
+        if ! docker volume inspect "${project}_rabbitmq_data" > /dev/null 2>&1; then
+            remove_broker_settings
+            return 0
+        fi
+        temporary="${project}-rabbitmq-check"
+        docker rm -f "$temporary" > /dev/null 2>&1 || true
+        docker run -d --name "$temporary" --hostname rabbitmq \
+            -v "${project}_rabbitmq_data:/var/lib/rabbitmq" rabbitmq:3.13-management > /dev/null 2>&1 ||
+            die "Could not start RabbitMQ to check the work the previous version left queued. Check that Docker can pull rabbitmq:3.13-management, then run the installer again."
+        broker="$temporary"
+    fi
+
+    info "Finishing the work queued by the previous version"
+    docker start "$broker" > /dev/null 2>&1 || true
+
+    # Without the previous containers nothing can process the work, so the
+    # count decides before anything else is touched.
+    if [ -n "$temporary" ]; then
+        count="$(queued_messages "$broker")" || count=''
+        docker rm -f "$temporary" > /dev/null 2>&1 || true
+        [ -n "$count" ] ||
+            die "Could not ask RabbitMQ how much work is queued. Run the installer again."
+        [ "$count" -eq 0 ] ||
+            die "Work is still queued for the previous version (${count} messages), and its containers are gone. Start that version again with its own compose.yaml until it is processed, then run the installer again. To drop the work instead: docker volume rm ${project}_rabbitmq_data"
+        ok "Queues empty"
+        remove_broker_settings
+        return 0
+    fi
+
+    # Nothing new comes in while the queues empty. Mail servers and uploaders
+    # retry, and mailboxes keep their reports until they are read.
+    for service in php postfix processor; do
+        service="$(project_container "$service")"
+        [ -z "$service" ] || docker stop "$service" > /dev/null 2>&1 || true
+    done
+    worker="$(project_container worker)"
+
+    while :; do
+        [ -z "$worker" ] || docker stop "$worker" > /dev/null 2>&1 || true
+        count="$(queued_messages "$broker")" ||
+            die "Could not ask RabbitMQ how much work is queued. Check: docker logs ${broker}"
+        [ "$count" -gt 0 ] || break
+
+        [ -n "$worker" ] ||
+            die "Work is still queued for the previous version (${count} messages), and its worker container is gone. Start that version again with its own compose.yaml until it is processed, then run the installer again. To drop the work instead: docker volume rm ${project}_rabbitmq_data"
+        [ "$waited" -gt 0 ] ||
+            note "     ${count} queued. The previous version processes them now, which can take a few minutes."
+        docker start "$worker" > /dev/null 2>&1 || true
+        while [ "$count" -gt 0 ]; do
+            [ "$waited" -lt 900 ] ||
+                die "${count} messages are still queued after 15 minutes. Check the previous worker with: docker logs ${worker}. Run the installer again once docker exec ${broker} rabbitmqctl list_queues shows 0."
+            sleep 5
+            waited=$((waited + 5))
+            count="$(queued_messages "$broker")" || count=1
+        done
+    done
+    ok "Queues empty"
+
+    # Removed by name, because the volume stays, and a broker container from
+    # the previous version would otherwise be asked again on every run.
+    docker rm -f "$broker" > /dev/null 2>&1 || true
+    remove_broker_settings
+}
+
+# Redis kept the cache, which holds the sign-outs: a token signed out before
+# the switch would work again for the rest of its hour without it. Valkey
+# cannot read what Redis 7.4 writes, neither its dump file nor its DUMP
+# payloads, so the backend copies the keys one by one, values and expiry, from
+# the Redis the previous version left running. Only into an empty Valkey, so a
+# later run cannot overwrite newer entries, and a failure costs no more than
+# the cache.
+carry_cache_over() {
+    local redis copied
+    redis="$(project_container redis)"
+    [ -n "$redis" ] || return 0
+    [ "$(compose exec -T valkey valkey-cli -n 0 dbsize 2> /dev/null | tr -d '\r')" = 0 ] || return 0
+
+    info "Copying the cache from Redis to Valkey"
+    docker start "$redis" > /dev/null 2>&1 || true
+    # shellcheck disable=SC2016  # PHP code, expanded by PHP and not the shell
+    if copied="$(compose run --rm --no-deps -T --entrypoint php php -r '
+        $from = new Redis(); $from->connect("redis", 6379, 5);
+        $to = new Redis(); $to->connect("valkey", 6379, 5);
+        $copied = 0; $it = null;
+        $from->setOption(Redis::OPT_SCAN, Redis::SCAN_RETRY);
+        while (false !== ($keys = $from->scan($it, "*", 500))) {
+            foreach ($keys as $key) {
+                if (Redis::REDIS_STRING !== $from->type($key)) { continue; }
+                $value = $from->get($key); $ttl = $from->pttl($key);
+                if (false === $value || -2 === $ttl) { continue; }
+                $ttl > 0 ? $to->set($key, $value, ["px" => $ttl]) : $to->set($key, $value);
+                ++$copied;
+            }
+        }
+        echo $copied;' 2> /dev/null | tail -n 1)"; then
+        ok "${copied:-0} entries"
+    else
+        warn "Could not copy the cache. Valkey starts empty: anyone signed out in the last hour may have to sign out again."
+    fi
+}
+
+# What RabbitMQ left in the configuration. Its data volume stays, because
+# deleting data is the operator's call. The summary says how.
+remove_broker_settings() {
+    local stale=() key
+    for key in RABBITMQ_USER RABBITMQ_PASSWORD; do
+        if env_file_has "$key"; then
+            stale+=("$key")
+        fi
+    done
+    if [ "${#stale[@]}" -gt 0 ]; then
+        backup_env
+        env_remove "${stale[@]}"
+    fi
+    BROKER_REMOVED=1
+}
+
 # 0.5 serves one account, and its migration stops on a database with more,
 # because which ones to keep is the operator's decision. Asked before the new
 # backend starts, so the previous version can still delete them.
@@ -679,6 +827,15 @@ check_single_account() {
     warn "Delete the ones you do not need with the version you are upgrading from, which deletes their domains and reports as well, then run the installer again:"
     printf '       cd %s\n       BACKEND_VERSION=0.4 docker compose run --rm php bin/console app:user:delete\n' "$INSTALL_DIR" >&2
     die "Stopped before the new version started. Nothing in the database was changed."
+}
+
+# What can stop an upgrade is asked before anything is stopped or changed: the
+# pinned versions, whether the new images can be pulled at all, and how many
+# accounts the database holds.
+prepare_upgrade() {
+    raise_pinned_versions
+    pull_images
+    check_single_account
 }
 
 # Docker volumes outlive the install directory, so an install that starts
@@ -714,8 +871,7 @@ write_configuration() {
         printf 'APP_SCHEME=%s\n\n' "$APP_SCHEME"
         printf 'APP_SECRET=%s\n' "$APP_SECRET"
         printf 'APP_ENCRYPTION_KEY=%s\n' "$APP_ENCRYPTION_KEY"
-        printf 'POSTGRES_PASSWORD=%s\n' "$POSTGRES_PASSWORD"
-        printf 'RABBITMQ_PASSWORD=%s\n\n' "$RABBITMQ_PASSWORD"
+        printf 'POSTGRES_PASSWORD=%s\n\n' "$POSTGRES_PASSWORD"
         if [ -n "${COMPOSE_PROFILES:-}" ]; then
             printf 'COMPOSE_PROFILES=%s\n' "$COMPOSE_PROFILES"
         fi
@@ -755,15 +911,14 @@ write_configuration() {
     umask 022
 }
 
-# Both data stores only read their password from the environment while they
-# initialize an empty volume. Over data from an earlier install they keep that
-# install's password instead, and every part of DMARCo then fails to sign in.
-# Setting the password from .env on every run keeps .env the one place it is
-# defined.
+# Postgres only reads its password from the environment while it initializes
+# an empty volume. Over data from an earlier install it keeps that install's
+# password instead, and every part of DMARCo then fails to sign in. Setting the
+# password from .env on every run keeps .env the one place it is defined.
 sync_credentials() {
-    local db_user="${POSTGRES_USER:-dmarco}" broker_user="${RABBITMQ_USER:-dmarco}"
+    local db_user="${POSTGRES_USER:-dmarco}"
 
-    info "Setting the stored passwords"
+    info "Setting the stored password"
 
     # :'password' lets psql quote the value, so a password containing a quote
     # stays a password instead of becoming SQL.
@@ -778,37 +933,36 @@ sync_credentials() {
         warn "Could not set the database password."
         warn "If this server still holds data from an earlier install, put that install's POSTGRES_PASSWORD back in ${INSTALL_DIR}/.env, or delete the old data with: cd ${INSTALL_DIR} && docker compose down -v"
     fi
+}
 
-    # shellcheck disable=SC2016  # DMARCO_USER and DMARCO_PASSWORD expand in the container, not here
-    if [ -z "${RABBITMQ_PASSWORD:-}" ]; then
-        warn "There is no RABBITMQ_PASSWORD to set."
-    elif compose exec -T rabbitmq rabbitmqctl -q change_password "$broker_user" "$RABBITMQ_PASSWORD" > /dev/null 2>&1; then
-        ok "Message broker"
-    elif compose exec -T -e DMARCO_USER="$broker_user" -e DMARCO_PASSWORD="$RABBITMQ_PASSWORD" rabbitmq sh -c '
-        rabbitmqctl -q add_user "$DMARCO_USER" "$DMARCO_PASSWORD" &&
-            rabbitmqctl -q set_user_tags "$DMARCO_USER" administrator &&
-            rabbitmqctl -q set_permissions -p / "$DMARCO_USER" ".*" ".*" ".*"' > /dev/null 2>&1; then
-        ok "Message broker"
+# Run once before an upgrade changes anything, and again before the start,
+# when .env may name more images, such as the mail gateway's. The second pull
+# finds the images it already has.
+pull_images() {
+    if [ -n "${IMAGES_PULLED:-}" ]; then
+        info "Pulling the images the configuration added, if any"
     else
-        warn "Could not set the message broker password. Check: docker compose logs rabbitmq"
+        info "Pulling images, which takes a few minutes on the first run"
     fi
+    compose pull --quiet ||
+        die "Could not pull the images. Check the network connection and run the installer again."
+    IMAGES_PULLED=1
 }
 
 start_stack() {
-    info "Pulling images, which takes a few minutes on the first run"
-    compose pull --quiet ||
-        die "Could not pull the images. Check the network connection and run the installer again."
+    pull_images
 
-    # The data stores go up first, because their passwords have to match .env
-    # before anything tries to connect.
-    info "Starting the database and the message broker"
-    compose up -d database rabbitmq ||
-        die "Could not start them. See what went wrong with: cd ${INSTALL_DIR} && docker compose logs database rabbitmq"
-    if wait_for_service database 300 && wait_for_service rabbitmq 300; then
+    # The data stores go up first, because the database password has to match
+    # .env before anything tries to connect.
+    info "Starting the database and Valkey"
+    compose up -d database valkey ||
+        die "Could not start them. See what went wrong with: cd ${INSTALL_DIR} && docker compose logs database valkey"
+    if wait_for_service database 300 && wait_for_service valkey 300; then
         sync_credentials
         check_single_account
+        carry_cache_over
     else
-        warn "The database or the message broker did not come up. Check: docker compose logs database rabbitmq"
+        warn "The database or Valkey did not come up. Check: docker compose logs database valkey"
     fi
 
     # Compose leaves the containers of a profile that is no longer active
@@ -818,7 +972,8 @@ start_stack() {
     fi
 
     # An install over an earlier one also clears out the services the recipe no
-    # longer has, such as the object storage releases before 0.4 ran.
+    # longer has, such as the object storage releases before 0.4 ran, and the
+    # RabbitMQ and Redis of releases before 0.6.
     info "Starting DMARCo"
     compose up -d --remove-orphans ||
         die "Could not start the stack. See what went wrong with: cd ${INSTALL_DIR} && docker compose logs"
@@ -1057,7 +1212,7 @@ configure_application() {
 
 print_summary() {
     local scheme="${APP_SCHEME:-https}"
-    local url="${scheme}://${APP_DOMAIN}" step=1 gateway_domain report_domain
+    local url="${scheme}://${APP_DOMAIN}" step=1 gateway_domain report_domain volume old_volumes
     gateway_domain="${MAIL_GATEWAY_DOMAIN:-${REPORT_DOMAIN:-$APP_DOMAIN}}"
     SMTP_HOSTNAME="${SMTP_HOSTNAME:-$APP_DOMAIN}"
 
@@ -1145,7 +1300,7 @@ ${C_BOLD}${step}. Everyday commands${C_RESET}
    cd ${INSTALL_DIR}
    docker compose ps
    docker compose logs -f
-   docker compose pull && docker compose up -d --remove-orphans  # upgrade
+   bash install.sh upgrade  # upgrade
 EOF
 
     if [ -z "${ACCOUNT_CREATED:-}" ]; then
@@ -1166,11 +1321,28 @@ ${C_BOLD}MinIO's data${C_RESET} is no longer used. Once DMARCo works, delete it 
 EOF
     fi
 
+    old_volumes=()
+    if [ -n "${BROKER_REMOVED:-}" ]; then
+        for volume in rabbitmq_data redis_data; do
+            volume="${COMPOSE_PROJECT_NAME:-dmarco}_${volume}"
+            docker volume inspect "$volume" > /dev/null 2>&1 && old_volumes+=("$volume")
+        done
+    fi
+    if [ "${#old_volumes[@]}" -gt 0 ]; then
+        cat <<EOF
+
+${C_BOLD}RabbitMQ's and Redis's data${C_RESET} is no longer used: Valkey keeps the queues
+and the cache now. Once DMARCo works, delete it with:
+
+   docker volume rm ${old_volumes[*]}
+EOF
+    fi
+
     if [ -n "${ENV_BACKUP:-}" ]; then
         cat <<EOF
 
 ${C_BOLD}The previous .env${C_RESET} is saved as ${ENV_BACKUP}. It holds the
-settings that moved into the database, passwords among them. Delete it once
+settings this run changed or removed, passwords among them. Delete it once
 DMARCo works.
 EOF
     fi
@@ -1185,29 +1357,68 @@ EOF
 }
 
 main() {
-    printf '\n%s%sDMARCo installer%s\n%sSelf-hosted DMARC report aggregation%s\n\n' \
-        "$C_BOLD" "$C_BLUE" "$C_RESET" "$C_DIM" "$C_RESET"
+    # A run that continues in the installer it just downloaded has said hello.
+    if [ -z "${DMARCO_FETCHED:-}" ]; then
+        printf '\n%s%sDMARCo installer%s\n%sSelf-hosted DMARC report aggregation%s\n\n' \
+            "$C_BOLD" "$C_BLUE" "$C_RESET" "$C_DIM" "$C_RESET"
+    fi
 
-    check_requirements
+    local arg upgrade="${DMARCO_UPGRADE:-}"
+    for arg in "$@"; do
+        case "$arg" in
+            upgrade | --upgrade) upgrade=1 ;;
+            -h | --help)
+                printf 'Usage: install.sh [upgrade]\n\n  upgrade  upgrade the install in this directory without asking\n'
+                exit 0
+                ;;
+            *) die "Unknown option: ${arg}. See install.sh --help." ;;
+        esac
+    done
+    # Upgrading asks nothing: every answer is already in .env.
+    [ -z "$upgrade" ] || DMARCO_YES=1
 
-    local script_dir='' source_dir=''
+    [ -n "${DMARCO_FETCHED:-}" ] || check_requirements
+
+    # Run from a checkout of the recipe, the installer uses the stack next to
+    # it as it is. Run from the copy it saved in an install directory, it is in
+    # that install and fetches the current stack, itself included.
+    local script_dir='' source_dir='' installed_copy=''
     if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
         script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-        if [ -f "${script_dir}/compose.yaml" ]; then
+        if [ -f "${script_dir}/compose.yaml" ] && [ -e "${script_dir}/.git" ]; then
             source_dir="$script_dir"
+        elif [ -f "${script_dir}/compose.yaml" ] && [ -f "${script_dir}/.env" ]; then
+            installed_copy="$script_dir"
+            # The current version of this script, saved by the run that
+            # started it, carries the upgrade steps this copy may not know.
+            [ -z "${DMARCO_FETCHED:-}" ] || source_dir="$script_dir"
         fi
     fi
 
     if [ -n "$source_dir" ]; then
         INSTALL_DIR="$source_dir"
+    elif [ -n "$installed_copy" ]; then
+        INSTALL_DIR="$installed_copy"
     else
         INSTALL_DIR="${DMARCO_DIR:-}"
-        ask INSTALL_DIR "Install DMARCo into" "$(pwd)/dmarco"
+        # Run from inside an install, as the README says to upgrade, the
+        # install is where it is.
+        if [ -f "$(pwd)/compose.yaml" ] && [ -f "$(pwd)/.env" ]; then
+            ask INSTALL_DIR "Install DMARCo into" "$(pwd)"
+        else
+            ask INSTALL_DIR "Install DMARCo into" "$(pwd)/dmarco"
+        fi
         mkdir -p "$INSTALL_DIR"
         INSTALL_DIR="$(cd "$INSTALL_DIR" && pwd)"
     fi
+    [ -z "$upgrade" ] || [ -f "${INSTALL_DIR}/.env" ] ||
+        die "There is no install to upgrade in ${INSTALL_DIR}: it has no .env. Run the installer without upgrade to install."
 
     fetch_stack "$source_dir"
+    if [ -n "$installed_copy" ] && [ -z "${DMARCO_FETCHED:-}" ]; then
+        info "Continuing with the installer just downloaded"
+        DMARCO_FETCHED=1 exec bash "${INSTALL_DIR}/install.sh" "$@"
+    fi
     cd "$INSTALL_DIR"
 
     if [ -f "${INSTALL_DIR}/.env" ]; then
@@ -1219,15 +1430,17 @@ main() {
             # once applied, so an install of any age reaches the new version
             # in one run, and a plain restart changes nothing.
             load_existing_configuration
+            prepare_upgrade
             drain_object_storage_queue
-            raise_pinned_versions
+            drain_message_broker
             ensure_encryption_key
             keep_gateway_running
         else
             confirm "Overwrite the existing configuration?" ||
                 die "Nothing to do."
+            prepare_upgrade
             drain_object_storage_queue
-            raise_pinned_versions
+            drain_message_broker
             # The old file holds secrets the data depends on, and settings
             # that only reach the database once the new version runs.
             backup_env
