@@ -163,15 +163,24 @@ existing_mx() {
 
 # Writes next to the target and renames, so a failed download leaves the old
 # file in place, and the copy of this script that bash is running keeps
-# reading the file it opened.
+# reading the file it opened. A file that has not changed is left as it is: a
+# running container that mounts it would otherwise keep the replaced file,
+# or, with Docker Desktop, lose it. REPLACED says whether an existing file
+# was replaced.
 download() {
     local url="$1" target="$2"
+    REPLACED=''
     mkdir -p "$(dirname "$target")"
     if command -v curl > /dev/null 2>&1; then
         curl -fsSL "$url" -o "${target}.download" || { rm -f "${target}.download"; return 1; }
     else
         wget -qO "${target}.download" "$url" || { rm -f "${target}.download"; return 1; }
     fi
+    if [ -f "$target" ] && cmp -s "${target}.download" "$target"; then
+        rm -f "${target}.download"
+        return 0
+    fi
+    [ ! -f "$target" ] || REPLACED=1
     [ "${target##*.}" != sh ] || chmod 755 "${target}.download"
     mv "${target}.download" "$target"
 }
@@ -265,7 +274,32 @@ fetch_stack() {
     for file in "${STACK_FILES[@]}"; do
         download "${RAW_BASE}/${file}" "${INSTALL_DIR}/${file}"
         ok "$file"
+        [ -n "$REPLACED" ] || continue
+        # Services that read a file of the stack mounted in, and only when
+        # they start. DMARCO_RECREATE also reaches the installer this one
+        # continues in.
+        case "$file" in
+            Caddyfile) DMARCO_RECREATE="${DMARCO_RECREATE:-} caddy" ;;
+            clamav/*) DMARCO_RECREATE="${DMARCO_RECREATE:-} clamav" ;;
+        esac
     done
+    export DMARCO_RECREATE="${DMARCO_RECREATE:-}"
+}
+
+# Compose recreates a container when its configuration changes, but not when
+# a file mounted into it does, so those services start again by name.
+recreate_changed_mounts() {
+    local service services=()
+    for service in $(printf '%s' "${DMARCO_RECREATE:-}" | tr ' ' '\n' | sort -u); do
+        # A service of a profile that is off would be started by naming it.
+        [ "$service" != clamav ] || has_profile mail-gateway || continue
+        services+=("$service")
+    done
+    [ "${#services[@]}" -gt 0 ] || return 0
+
+    info "Restarting ${services[*]} with the configuration just downloaded"
+    compose up -d --no-deps --force-recreate "${services[@]}" ||
+        warn "Could not restart them. Run: cd ${INSTALL_DIR} && docker compose up -d --force-recreate ${services[*]}"
 }
 
 # ------------------------------------------------------------- reading .env
@@ -1028,6 +1062,7 @@ start_stack() {
     info "Starting DMARCo"
     compose up -d --remove-orphans ||
         die "Could not start the stack. See what went wrong with: cd ${INSTALL_DIR} && docker compose logs"
+    recreate_changed_mounts
 
     info "Waiting for the application to become ready"
     if wait_for_service php 300; then
