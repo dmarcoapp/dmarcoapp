@@ -103,12 +103,13 @@ services:
       php:
         condition: service_started
 
-  # ------------------------------------------------- mail gateway (opt-in, old)
+  # -------------------------------------------------- mail gateway (retired)
   # Receives report email on port 25 and posts each report to the backend. Off
-  # unless COMPOSE_PROFILES in .env names mail-gateway. Mailboxes read over
+  # unless COMPOSE_PROFILES in .env names mail-gateway, which only installs
+  # that already used it do. 0.4 is its last release. Mailboxes read over
   # IMAP, and uploads with an API key, need none of it.
   postfix:
-    image: ghcr.io/dmarcoapp/mail-inbound/postfix:${MAIL_INBOUND_VERSION:-latest}
+    image: ghcr.io/dmarcoapp/mail-inbound/postfix:${MAIL_INBOUND_VERSION:-0.4}
     profiles:
       - mail-gateway
     restart: unless-stopped
@@ -132,7 +133,7 @@ services:
       retries: 3
 
   processor:
-    image: ghcr.io/dmarcoapp/mail-inbound/processor:${MAIL_INBOUND_VERSION:-latest}
+    image: ghcr.io/dmarcoapp/mail-inbound/processor:${MAIL_INBOUND_VERSION:-0.4}
     profiles:
       - mail-gateway
     restart: unless-stopped
@@ -173,7 +174,7 @@ services:
 
   # -------------- publicly trusted certificate for the mail gateway (opt-in)
   certbot:
-    image: ghcr.io/dmarcoapp/mail-inbound/certbot:${MAIL_INBOUND_VERSION:-latest}
+    image: ghcr.io/dmarcoapp/mail-inbound/certbot:${MAIL_INBOUND_VERSION:-0.4}
     profiles:
       - letsencrypt
     restart: unless-stopped
@@ -187,7 +188,7 @@ services:
       - letsencrypt_lib:/var/lib/letsencrypt
 
   cert-exporter:
-    image: ghcr.io/dmarcoapp/mail-inbound/cert-exporter:${MAIL_INBOUND_VERSION:-latest}
+    image: ghcr.io/dmarcoapp/mail-inbound/cert-exporter:${MAIL_INBOUND_VERSION:-0.4}
     profiles:
       - letsencrypt
     restart: unless-stopped

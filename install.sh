@@ -26,6 +26,9 @@ REF="${DMARCO_REF:-main}"
 RAW_BASE="${DMARCO_RAW_BASE:-https://raw.githubusercontent.com/${REPO}/${REF}}"
 STACK_FILES=(compose.yaml Caddyfile .env.example clamav/clamd.conf clamav/freshclam.conf install.sh)
 
+# The last release of the retired mail gateway.
+GATEWAY_VERSION=0.4
+
 # The settings 0.4 kept in .env, which live in the database from 0.5 on.
 LEGACY_SETTINGS=(REPORT_DOMAIN WEBHOOK_SECRET MAILER_DSN APP_EMAIL_SENDER_ADDRESS
     APP_REPORT_RETENTION_DAYS APP_IP_LOOKUP_ENABLED)
@@ -374,38 +377,66 @@ add_profile() {
 
 # ------------------------------------------------------------ configuration
 
-# Which ways in the reports take. Any combination works, side by side.
+# Which ways in the reports take. Any combination works, side by side. The
+# mail gateway is retired: only an install that already runs it, and whose
+# configuration is being overwritten, may keep it.
 choose_intake() {
-    local choice token valid
+    local choice token valid retired default=1 answers='1, 2'
     INTAKE_IMAP=''; INTAKE_API=''; INTAKE_GATEWAY=''
+    if [ -n "${GATEWAY_IN_USE:-}" ]; then
+        default=3; answers='1, 2, 3'
+    fi
 
     if [ -z "${DMARCO_INTAKE:-}" ]; then
         printf '\n%sHow should DMARC reports reach DMARCo?%s\n\n' "$C_BOLD" "$C_RESET"
         printf '  1  From a mailbox you already have, read over IMAP\n'
         printf '  2  Uploaded through the API, with a key\n'
-        printf '  3  Received by email on this server, by the mail gateway on port 25.\n'
-        printf '     The older way, being retired.\n\n'
+        if [ -n "${GATEWAY_IN_USE:-}" ]; then
+            printf '  3  By the mail gateway on port 25, as this install does now. It is\n'
+            printf '     retired and gets no more updates, so plan the move to a mailbox.\n'
+        fi
+        printf '\n'
     fi
 
     while true; do
         choice="${DMARCO_INTAKE:-}"
-        ask choice "Pick one or more, such as 1 or 1,2" "1"
-        valid=1
+        ask choice "Pick one or more, such as 1 or 1,2" "$default"
+        valid=1; retired=''
         for token in ${choice//,/ }; do
             case "$token" in
                 1 | imap) INTAKE_IMAP=1 ;;
                 2 | api) INTAKE_API=1 ;;
-                3 | gateway) INTAKE_GATEWAY=1 ;;
+                3 | gateway)
+                    if [ -n "${GATEWAY_IN_USE:-}" ]; then
+                        INTAKE_GATEWAY=1
+                    elif [ -n "${DMARCO_INTAKE:-}" ]; then
+                        die "The mail gateway is retired, and new installs cannot use it. Read reports from a mailbox instead, with DMARCO_INTAKE=imap."
+                    else
+                        warn "The mail gateway is retired, and new installs cannot use it. Read reports from a mailbox instead."
+                        valid=''; retired=1
+                    fi
+                    ;;
                 *) valid='' ;;
             esac
         done
         if [ -n "$valid" ] && [ -n "${INTAKE_IMAP}${INTAKE_API}${INTAKE_GATEWAY}" ]; then
             return 0
         fi
-        [ -z "${DMARCO_INTAKE:-}" ] || die "DMARCO_INTAKE takes imap, api, and gateway, separated by commas."
-        warn "Answer with 1, 2, 3, or several of them separated by commas."
+        [ -z "${DMARCO_INTAKE:-}" ] || die "DMARCO_INTAKE takes imap and api, separated by a comma."
+        [ -n "$retired" ] || warn "Answer with ${answers}, or several of them separated by commas."
         INTAKE_IMAP=''; INTAKE_API=''; INTAKE_GATEWAY=''
     done
+}
+
+# Whether the install in INSTALL_DIR receives its reports through the mail
+# gateway: its profile is on, or the .env is from 0.4 or earlier, when the
+# gateway was the only way in.
+gateway_in_use() {
+    [ -f "${INSTALL_DIR}/.env" ] || return 1
+    case ",$(env_file_value COMPOSE_PROFILES)," in
+        *,mail-gateway,*) return 0 ;;
+    esac
+    env_file_has REPORT_DOMAIN
 }
 
 collect_mailbox() {
@@ -537,9 +568,9 @@ keep_gateway_running() {
 
     info "Keeping the mail gateway running"
     note "This install receives its reports through the mail gateway, which now runs only
-with mail-gateway in COMPOSE_PROFILES. It stays on. Mailboxes read over IMAP
-replace it: add one on the Platform page, and the README says how to switch the
-gateway off afterwards."
+with mail-gateway in COMPOSE_PROFILES. It stays on for now, but it is retired and
+gets no more updates. Mailboxes read over IMAP replace it: add one on the Platform
+page, and the README says how to move over and switch the gateway off."
     backup_env
     add_profile mail-gateway
     env_set COMPOSE_PROFILES "$COMPOSE_PROFILES"
@@ -597,6 +628,23 @@ raise_pinned_versions() {
         fi
         ok "${name}=0.${minimum}"
     done
+}
+
+# The mail gateway is retired, and 0.4 is its last release, the one that
+# posts each report in the webhook. latest names the same images today but
+# would hide that nothing newer comes, and a pin below 0.4 still expects the
+# object storage that 0.5 removed. Other pins are left alone.
+pin_gateway_version() {
+    local value
+    env_file_has MAIL_INBOUND_VERSION || return 0
+    value="$(env_file_value MAIL_INBOUND_VERSION)"
+    if [ -n "$value" ] && [ "$value" != latest ] && ! version_below "$value" 4; then
+        return 0
+    fi
+
+    backup_env
+    env_set MAIL_INBOUND_VERSION "$GATEWAY_VERSION"
+    ok "MAIL_INBOUND_VERSION=${GATEWAY_VERSION}, the mail gateway's last release"
 }
 
 # The messages waiting in the broker of the previous install, or nothing when
@@ -834,6 +882,7 @@ check_single_account() {
 # accounts the database holds.
 prepare_upgrade() {
     raise_pinned_versions
+    pin_gateway_version
     pull_images
     check_single_account
 }
@@ -884,7 +933,9 @@ write_configuration() {
         [ -z "${COMPOSE_PROFILES:-}${INTAKE_GATEWAY:-}" ] || printf '\n'
         printf 'BACKEND_VERSION=%s\n' "${BACKEND_VERSION:-latest}"
         printf 'DASHBOARD_VERSION=%s\n' "${DASHBOARD_VERSION:-latest}"
-        printf 'MAIL_INBOUND_VERSION=%s\n' "${MAIL_INBOUND_VERSION:-latest}"
+        if [ -n "${INTAKE_GATEWAY:-}" ]; then
+            printf 'MAIL_INBOUND_VERSION=%s\n' "$GATEWAY_VERSION"
+        fi
     } > "${INSTALL_DIR}/.env"
     chmod 600 "${INSTALL_DIR}/.env"
     ok ".env"
@@ -1438,6 +1489,7 @@ main() {
         else
             confirm "Overwrite the existing configuration?" ||
                 die "Nothing to do."
+            ! gateway_in_use || GATEWAY_IN_USE=1
             prepare_upgrade
             drain_object_storage_queue
             drain_message_broker
