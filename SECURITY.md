@@ -8,6 +8,10 @@ own server, so security reports come before everything else.
 Only the latest release is supported. Fixes land on `main` and go out in the
 next release; there are no backports to older tags.
 
+The mail gateway is retired. Its last release is `0.4`, and it gets no more
+fixes, security fixes included. Report a vulnerability in it all the same, so
+that the installs still running it can be told to switch it off.
+
 ## Reporting a vulnerability
 
 Please do not open a public issue, and do not post details in a pull request or

@@ -5,13 +5,14 @@ Thanks for wanting to help. DMARCo is small, so the process is short.
 ## Where things live
 
 This repository holds the installer, the Compose stack, and the user-facing
-documentation. The application itself is developed in three repositories:
+documentation. The application itself is developed in two repositories:
 
 - [`dmarcoapp/backend`](https://github.com/dmarcoapp/backend): API, workers,
   report processing
 - [`dmarcoapp/dashboard`](https://github.com/dmarcoapp/dashboard): web UI
-- [`dmarcoapp/mail-inbound`](https://github.com/dmarcoapp/mail-inbound): the
-  mail gateway, retired
+
+The mail gateway, [`dmarcoapp/mail-inbound`](https://github.com/dmarcoapp/mail-inbound),
+is retired and archived, and takes no pull requests.
 
 Open the pull request against the repository that holds the code you are
 changing. **Issues, however, all belong here**, in
@@ -32,7 +33,6 @@ in mind. It is a small project; a short conversation saves a large rewrite.
   - backend: `vendor/bin/phpunit`, `vendor/bin/php-cs-fixer fix --dry-run
     --diff`, `bin/console cache:warmup && vendor/bin/psalm`
   - dashboard: `npm run lint`, `npm run build`
-  - mail-inbound: `npm run lint`, `npm test`, `npm run coverage`
   - this repository: `docker compose config --quiet`, `shellcheck install.sh`
 - Update the documentation in the same pull request when behavior changes.
 - New configuration must reach the installed stack: add it to `.env.example`,
