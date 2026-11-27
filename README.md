@@ -99,10 +99,11 @@ should come in: from a mailbox over IMAP, through uploads with an API key, or
 both. It asks for what the choice needs, such as
 the mailbox's server and password, and checks that DMARCo can sign in. It
 generates every password and secret, starts the stack, and creates your
-account. It takes a couple of minutes, most of it spent pulling images.
+account. It also asks which time zone the dashboard shows dates in, suggesting
+the server's own. It takes a couple of minutes, most of it spent pulling images.
 
-Outgoing email, report retention, and IP lookups are set afterwards, on the
-dashboard's Platform page.
+Outgoing email, report retention, IP lookups, and the time zone are set
+afterwards, on the dashboard's Platform page.
 
 Prefer to read before you run? The script is [install.sh](install.sh), and the
 manual route is below.
@@ -356,9 +357,14 @@ Postfix reads the file at startup, so restart it after a renewal.
 | `MAIL_INBOUND_VERSION` | The mail gateway's image tag, `0.4`, its last release |
 
 Everything else is on the dashboard's Platform page and kept in the database:
-report retention, IP lookups, outgoing email and its sender address, mailboxes,
-the API switches, API keys, and the webhook's domain and secret. Outgoing email
-is optional, and the page sends a test email to check it.
+report retention, IP lookups, the time zone, outgoing email and its sender
+address, mailboxes, the API switches, API keys, and the webhook's domain and
+secret. Outgoing email is optional, and the page sends a test email to check it.
+
+The time zone only changes what the dashboard shows: dates and times appear in
+it, with the same moment in UTC on hover, and are stored in UTC either way.
+`docker compose exec php bin/console app:platform:timezone Europe/Budapest` sets
+it from the server.
 
 Keep `APP_ENCRYPTION_KEY` with your backups. Without it, the stored passwords
 cannot be read, and each has to be entered again.
@@ -461,6 +467,12 @@ together, `0.7` and `0.8` do not. When the two pins are on different minor
 releases and one is 0.7 or later, the installer offers to raise the older one.
 It sets `MAIL_INBOUND_VERSION` to `0.4`, the mail gateway's last release, when
 it is `latest` or older.
+
+#### From 0.7
+
+Run the installer as above. Nothing in `.env` changes. The dashboard keeps
+showing dates in UTC until you pick a time zone on the Platform page, under
+General.
 
 #### From 0.6
 

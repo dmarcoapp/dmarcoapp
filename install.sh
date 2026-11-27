@@ -512,6 +512,58 @@ collect_mailbox() {
     IMAP_NAME="${IMAP_NAME:-DMARC reports}"
 }
 
+# The host's own time zone, the first guess for the dashboard's.
+host_timezone() {
+    local zone=''
+    if command -v timedatectl > /dev/null 2>&1; then
+        zone="$(timedatectl show --property=Timezone --value 2> /dev/null || true)"
+    fi
+    if [ -z "$zone" ] && [ -r /etc/timezone ]; then
+        zone="$(head -n 1 /etc/timezone)"
+    fi
+    if [ -z "$zone" ] && [ -L /etc/localtime ]; then
+        zone="$(readlink /etc/localtime)"
+        zone="${zone##*/zoneinfo/}"
+    fi
+    case "$zone" in
+        '' | */*/*/* | *[[:space:]]* | /*) printf 'UTC' ;;
+        *) printf '%s' "$zone" ;;
+    esac
+}
+
+# Checked against the host's time zone database when it has one. The backend
+# checks it again when it takes it.
+known_timezone() {
+    case "$1" in
+        '' | *[[:space:]]* | *..* | /* | */) return 1 ;;
+        [uU][tT][cC]) return 0 ;;
+    esac
+    [ -d /usr/share/zoneinfo ] || return 0
+    [ -f "/usr/share/zoneinfo/$1" ]
+}
+
+# What the running backend has, when an earlier install is up and knows the
+# setting, so an overwrite does not undo a zone picked on the Platform page.
+current_timezone() {
+    compose exec -T php bin/console app:platform:timezone 2> /dev/null | tr -d '\r' | tail -n 1 || true
+}
+
+collect_timezone() {
+    local suggested
+    suggested="$(current_timezone)"
+    known_timezone "$suggested" || suggested="$(host_timezone)"
+    known_timezone "$suggested" || suggested=UTC
+
+    printf '\n%sThe dashboard shows dates and times in this time zone, and in UTC on hover.\nThey are stored in UTC either way.%s\n\n' "$C_DIM" "$C_RESET"
+    while true; do
+        ask DISPLAY_TIMEZONE "Time zone, such as Europe/Budapest or UTC" "$suggested"
+        known_timezone "$DISPLAY_TIMEZONE" && break
+        [ -z "${DMARCO_YES:-}" ] || die "DISPLAY_TIMEZONE is not a time zone: ${DISPLAY_TIMEZONE}"
+        warn "Answer with a time zone name, such as Europe/Budapest, America/New_York, or UTC."
+        DISPLAY_TIMEZONE=''
+    done
+}
+
 collect_gateway() {
     printf '\n%sThe mail gateway runs Postfix on port 25, for a domain whose MX record points\nhere, and scans each report with ClamAV, which needs about 1.5 GB of memory.%s\n\n' "$C_DIM" "$C_RESET"
 
@@ -550,8 +602,9 @@ collect_configuration() {
     choose_intake
     [ -z "$INTAKE_IMAP" ] || collect_mailbox
     [ -z "$INTAKE_GATEWAY" ] || collect_gateway
+    collect_timezone
 
-    printf '\n%sOutgoing email for notifications, report retention, and IP lookups are set\non the Platform page of the dashboard once it runs.%s\n' "$C_DIM" "$C_RESET"
+    printf '\n%sOutgoing email for notifications, report retention, IP lookups, and the time\nzone are set on the Platform page of the dashboard once it runs.%s\n' "$C_DIM" "$C_RESET"
 
     APP_SCHEME="${APP_SCHEME:-https}"
     CORS_ALLOW_ORIGIN="${CORS_ALLOW_ORIGIN:-^${APP_SCHEME}://$(regex_escape "$APP_DOMAIN")$}"
@@ -1293,6 +1346,17 @@ add_mailbox() {
     fi
 }
 
+# Not kept in .env: the time zone is a setting of the dashboard, which keeps it
+# in the database.
+set_display_timezone() {
+    [ -n "${DISPLAY_TIMEZONE:-}" ] || return 0
+    if compose exec -T php bin/console app:platform:timezone "$DISPLAY_TIMEZONE" > /dev/null 2>&1; then
+        ok "Dates are shown in ${DISPLAY_TIMEZONE}"
+    else
+        warn "Could not set the time zone. Set it on the Platform page, under General."
+    fi
+}
+
 create_api_key() {
     info "Creating an API key for report uploads"
     API_KEY="$(compose exec -T php bin/console app:intake:api-key:create "install.sh" --enable-api --quiet-key 2> /dev/null |
@@ -1331,6 +1395,7 @@ configure_application() {
 
     settle_environment
     import_new_settings
+    set_display_timezone
     [ -z "${INTAKE_IMAP:-}" ] || add_mailbox
     [ -z "${INTAKE_API:-}" ] || create_api_key
 
