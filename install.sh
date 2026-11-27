@@ -24,7 +24,9 @@ set -euo pipefail
 REPO="${DMARCO_REPO:-dmarcoapp/dmarcoapp}"
 REF="${DMARCO_REF:-main}"
 RAW_BASE="${DMARCO_RAW_BASE:-https://raw.githubusercontent.com/${REPO}/${REF}}"
-STACK_FILES=(compose.yaml Caddyfile .env.example clamav/clamd.conf clamav/freshclam.conf install.sh)
+# The ClamAV files of the retired mail gateway are not among them: no new
+# install gets the gateway, and the installs that run it keep their own copies.
+STACK_FILES=(compose.yaml Caddyfile .env.example install.sh)
 
 # The last release of the retired mail gateway.
 GATEWAY_VERSION=0.4
@@ -278,10 +280,7 @@ fetch_stack() {
         # Services that read a file of the stack mounted in, and only when
         # they start. DMARCO_RECREATE also reaches the installer this one
         # continues in.
-        case "$file" in
-            Caddyfile) DMARCO_RECREATE="${DMARCO_RECREATE:-} caddy" ;;
-            clamav/*) DMARCO_RECREATE="${DMARCO_RECREATE:-} clamav" ;;
-        esac
+        [ "$file" != Caddyfile ] || DMARCO_RECREATE="${DMARCO_RECREATE:-} caddy"
     done
     export DMARCO_RECREATE="${DMARCO_RECREATE:-}"
 }
@@ -291,8 +290,6 @@ fetch_stack() {
 recreate_changed_mounts() {
     local service services=()
     for service in $(printf '%s' "${DMARCO_RECREATE:-}" | tr ' ' '\n' | sort -u); do
-        # A service of a profile that is off would be started by naming it.
-        [ "$service" != clamav ] || has_profile mail-gateway || continue
         services+=("$service")
     done
     [ "${#services[@]}" -gt 0 ] || return 0
