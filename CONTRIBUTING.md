@@ -45,6 +45,15 @@ in mind. It is a small project; a short conversation saves a large rewrite.
   than a version number and does nothing once applied, so an install of any age
   reaches the new version in one run without editing files by hand.
 
+## Releases
+
+Every minor release ships the backend and the dashboard together under the
+same number, even when one of them has not changed, so that the same minor
+release always means a dashboard and a backend that work together. 0.7 was the
+first such pair; the dashboard skipped 0.6 to get there. A patch release, such
+as 0.7.1, comes out for one of them alone and keeps working with every release
+of the other in the same minor release.
+
 ## Commits
 
 Write commit subjects in the imperative mood, explaining the change rather than

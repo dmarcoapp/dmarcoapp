@@ -664,6 +664,55 @@ raise_pinned_versions() {
     done
 }
 
+# The minor release of a version tag: 7 for 0.7 or v0.7.2. Fails on a tag that
+# is not a 0.x version, latest among them.
+minor_release() {
+    local tag="${1#v}" minor
+    case "$tag" in
+        0.[0-9]*) ;;
+        *) return 1 ;;
+    esac
+    minor="${tag#0.}"
+    minor="${minor%%.*}"
+    case "$minor" in
+        '' | *[!0-9]*) return 1 ;;
+    esac
+    printf '%s' "$minor"
+}
+
+# From 0.7 on, every minor release ships the backend and the dashboard
+# together, and a dashboard works with any backend of the same minor release:
+# 0.7 with 0.7.1, for example. Patch releases come out on their own. Two pins
+# on different minor releases, one of them 0.7 or later, are offered the newer
+# minor release, as its first tag, which both images have. Older pairs, and
+# latest, are left alone.
+align_pinned_versions() {
+    local backend dashboard lower higher value
+    backend="$(minor_release "${BACKEND_VERSION:-}")" || return 0
+    dashboard="$(minor_release "${DASHBOARD_VERSION:-}")" || return 0
+    [ "$backend" -ne "$dashboard" ] || return 0
+    [ "$backend" -ge 7 ] || [ "$dashboard" -ge 7 ] || return 0
+
+    if [ "$backend" -lt "$dashboard" ]; then
+        lower=BACKEND_VERSION higher=DASHBOARD_VERSION
+    else
+        lower=DASHBOARD_VERSION higher=BACKEND_VERSION
+    fi
+
+    value="0.$(minor_release "${!higher}")"
+    warn "BACKEND_VERSION is ${BACKEND_VERSION} and DASHBOARD_VERSION is ${DASHBOARD_VERSION}. From 0.7 on, a dashboard works with a backend of the same minor release, such as 0.7 with 0.7.1."
+    if ! confirm "Set ${lower} to ${value} as well?"; then
+        warn "Kept ${lower}=${!lower}. Pages that need the other version may be empty or fail."
+        return 0
+    fi
+    printf -v "$lower" '%s' "$value"
+    if [ -f "${INSTALL_DIR}/.env" ] && env_file_has "$lower"; then
+        backup_env
+        env_set "$lower" "$value"
+    fi
+    ok "${lower}=${value}"
+}
+
 # The mail gateway is retired, and 0.4 is its last release, the one that
 # posts each report in the webhook. latest names the same images today but
 # would hide that nothing newer comes, and a pin below 0.4 still expects the
@@ -912,10 +961,11 @@ check_single_account() {
 }
 
 # What can stop an upgrade is asked before anything is stopped or changed: the
-# pinned versions, whether the new images can be pulled at all, and how many
+# pinned versions and whether they match, whether the new images can be pulled at all, and how many
 # accounts the database holds.
 prepare_upgrade() {
     raise_pinned_versions
+    align_pinned_versions
     pin_gateway_version
     pull_images
     check_single_account

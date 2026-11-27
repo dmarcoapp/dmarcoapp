@@ -352,7 +352,7 @@ Postfix reads the file at startup, so restart it after a renewal.
 | `APP_ENCRYPTION_KEY` | Encrypts the passwords and secrets kept in the database |
 | `COMPOSE_PROFILES` | `mail-gateway` to keep the retired mail gateway running |
 | `MAIL_GATEWAY_DOMAIN`, `SMTP_HOSTNAME`, `SMTP_TLS_MODE`, `CLAMAV_SCAN_ENABLED` | The mail gateway's domain, hostname, certificate, and virus scanning |
-| `BACKEND_VERSION`, `DASHBOARD_VERSION` | Image tags, pin these for reproducible upgrades |
+| `BACKEND_VERSION`, `DASHBOARD_VERSION` | Image tags, pin both to the same minor release for reproducible upgrades |
 | `MAIL_INBOUND_VERSION` | The mail gateway's image tag, `0.4`, its last release |
 
 Everything else is on the dashboard's Platform page and kept in the database:
@@ -454,9 +454,20 @@ DMARCO_UPGRADE=1 bash -c "$(curl -fsSL https://raw.githubusercontent.com/dmarcoa
 ```
 
 Pin `BACKEND_VERSION` and `DASHBOARD_VERSION` in `.env` to release tags if you
-would rather decide when new versions land. The installer sets
-`MAIL_INBOUND_VERSION` to `0.4`, the mail gateway's last release, when it is
-`latest` or older.
+would rather decide when new versions land. From 0.7 on, every minor release
+ships the backend and the dashboard together, and the rule is simple: a
+dashboard works with a backend of the same minor release. `0.7` and `0.7.1` go
+together, `0.7` and `0.8` do not. When the two pins are on different minor
+releases and one is 0.7 or later, the installer offers to raise the older one.
+It sets `MAIL_INBOUND_VERSION` to `0.4`, the mail gateway's last release, when
+it is `latest` or older.
+
+#### From 0.6
+
+Run the installer as above. Nothing in `.env` changes, unless the two pins
+are on different minor releases. On start, the backend fills in when each domain last received a report
+from the reports already stored. Reports stored before 0.5 show the webhook as
+the way they came in, because the mail gateway posted them there.
 
 #### From 0.5
 
