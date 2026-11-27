@@ -493,10 +493,22 @@ collect_mailbox() {
     ask IMAP_USERNAME "Username" ""
     ask_secret IMAP_PASSWORD "Password, or an app password if the provider has them"
     ask IMAP_FOLDER "Folder the reports arrive in" "INBOX"
+    # The address the add-domain dialog offers for this mailbox: without one,
+    # the mailbox reads reports but no DMARC record points at it.
+    local suggested=''
     case "$IMAP_USERNAME" in
-        *@*.*) ask IMAP_REPORT_ADDRESS "Address your DMARC records send reports to" "$IMAP_USERNAME" ;;
-        *) ask IMAP_REPORT_ADDRESS "Address your DMARC records send reports to" "" ;;
+        *@*.*) suggested="$IMAP_USERNAME" ;;
     esac
+    while true; do
+        ask IMAP_REPORT_ADDRESS "Address your DMARC records send reports to, which delivers to this mailbox" "$suggested"
+        case "$IMAP_REPORT_ADDRESS" in
+            *[[:space:]]* | *@*@* | @* | *@) ;;
+            *@*.*) break ;;
+        esac
+        [ -z "${DMARCO_YES:-}" ] || die "IMAP_REPORT_ADDRESS is not an email address: ${IMAP_REPORT_ADDRESS}"
+        warn "Answer with an email address, such as dmarc@example.com."
+        IMAP_REPORT_ADDRESS=''
+    done
     IMAP_NAME="${IMAP_NAME:-DMARC reports}"
 }
 
