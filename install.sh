@@ -474,7 +474,7 @@ gateway_in_use() {
 }
 
 collect_mailbox() {
-    printf '\n%sThe mailbox your DMARC records send reports to. DMARCo signs in over TLS,\nchecks the certificate, and touches only messages with a report attached.%s\n\n' "$C_DIM" "$C_RESET"
+    printf '\n%sThe mailbox your DMARC reports arrive in. DMARCo signs in over TLS,\nchecks the certificate, and touches only messages with a report attached.%s\n\n' "$C_DIM" "$C_RESET"
 
     ask IMAP_HOST "IMAP server" ""
     while true; do
@@ -500,7 +500,7 @@ collect_mailbox() {
         *@*.*) suggested="$IMAP_USERNAME" ;;
     esac
     while true; do
-        ask IMAP_REPORT_ADDRESS "Address your DMARC records send reports to, which delivers to this mailbox" "$suggested"
+        ask IMAP_REPORT_ADDRESS "Report address for your DMARC records (rua=mailto:), usually this mailbox's own address" "$suggested"
         case "$IMAP_REPORT_ADDRESS" in
             *[[:space:]]* | *@*@* | @* | *@) ;;
             *@*.*) break ;;
